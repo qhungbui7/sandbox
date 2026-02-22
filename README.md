@@ -42,7 +42,7 @@ python3 amg.py \
   --num-envs 8 \
   --total-steps 500000 \
   --wandb \
-  --wandb-project amt-dev \
+  --wandb-project amt \
   --wandb-run-name cartpole_amp_demo \
   --amp \
   --amp-dtype float16
@@ -60,6 +60,9 @@ This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on
 | `--wandb`, `--wandb-project`, `--wandb-tags` | Opt-in telemetry to Weights & Biases. |
 | `--amp`, `--amp-dtype` | CUDA mixed precision (half precision or bfloat16). |
 | `--log-interval` | How often (in updates) to print the rolling metrics. |
+| `--cuda-id` | Explicit CUDA device index (e.g., 0–7) to pin the run to a specific GPU. |
+| `--config` | YAML file to override defaults. CLI flags still win. |
+| `--policy` | `amt` (default), `recurrent` (LSTM core), or `ff` (feed-forward PPO proxy). |
 
 ## W&B logging guide
 
@@ -72,6 +75,36 @@ This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on
 3. Metrics logged each update: rolling return/length, gate mean, PPO losses, KL, clip fraction, plus the cumulative frame count.
 
 W&B logging is optional—trying to enable it without the package installed raises a clear error so you know to `pip install wandb`.
+
+## Baseline variants (paper runs)
+
+Use `run_paper.sh` to launch the baselines with consistent seeds and W&B logging. Examples:
+
+```bash
+# AMT-PPO (adaptive traces, predictor loss, AMP fp16)
+SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh baseline
+
+# Feed-forward PPO proxy (no adaptive memory, no resets/predictor)
+SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-ff
+
+# Fixed-trace PPO (multi-timescale traces, no adaptive gating/resets)
+SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-fixed-trace
+
+# Recurrent PPO (LSTM core, no trace memory) via policy flag
+python3 amg.py --policy recurrent --config configs/recurrent_cartpole.yaml
+
+# YAML-driven single runs (no bash wrapper)
+# Baseline AMT
+python3 amg.py --config configs/amt_cartpole.yaml --wandb --wandb-run-name amt_s0 --seed 0
+# Ablations
+python3 amg.py --config configs/no_amp_cartpole.yaml --wandb --wandb-run-name no_amp_s0 --seed 0
+python3 amg.py --config configs/no_pred_cartpole.yaml --wandb --wandb-run-name no_pred_s0 --seed 0
+python3 amg.py --config configs/zero_reset_cartpole.yaml --wandb --wandb-run-name zero_reset_s0 --seed 0
+python3 amg.py --config configs/ppo_ff_cartpole.yaml --wandb --wandb-run-name ppo_ff_s0 --seed 0
+python3 amg.py --config configs/ppo_fixed_trace_cartpole.yaml --wandb --wandb-run-name ppo_fixed_s0 --seed 0
+```
+
+Additional ablations: `no-amp`, `no-pred`, `zero-reset` (see script help).
 
 ## Mixed precision (AMP) details
 
