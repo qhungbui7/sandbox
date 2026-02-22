@@ -2,20 +2,45 @@
 import argparse
 import contextlib
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda import amp
 from torch.distributions.categorical import Categorical
+import yaml
 
 import gymnasium as gym
 
 
 import wandb
 
+
+def load_env_file(path: str | Path | None = None) -> None:
+    """Load key=value pairs from a .env file into os.environ."""
+    env_path = Path(path) if path is not None else Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and ((value[0] == value[-1]) and value[0] in {'"', "'"}):
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def resolve_device(device_str: str, cuda_id: int | None) -> str:
+    """Normalize device selection and allow explicit CUDA index override."""
+    if cuda_id is not None:
+        return f"cuda:{cuda_id}"
+    return device_str
 
 
 def set_seed(seed: int) -> None:
@@ -190,6 +215,33 @@ class Predictor(nn.Module):
         return self.net(torch.cat([x_mem, a], dim=-1))
 
 
+class RecurrentActorCritic(nn.Module):
+    """PPO policy with an LSTM core (no external trace memory)."""
+
+    def __init__(self, obs_dim: int, act_dim: int, act_embed_dim: int, hidden_dim: int, feat_dim: int):
+        super().__init__()
+        self.f_pol = FeatureEncoder(obs_dim, act_dim, act_embed_dim, hidden_dim, feat_dim)
+        self.lstm = nn.LSTM(input_size=feat_dim, hidden_size=hidden_dim, num_layers=1)
+        self.pi = nn.Linear(hidden_dim, act_dim)
+        self.v = nn.Linear(hidden_dim, 1)
+
+    def init_hidden(self, batch_size: int, device: str):
+        h = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
+        c = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
+        return h, c
+
+    def forward(
+        self, obs: torch.Tensor, prev_action: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        x = self.f_pol(obs, prev_action)  # [B, feat]
+        x = x.unsqueeze(0)  # [1, B, feat]
+        out, (h, c) = self.lstm(x, hidden)
+        out = out.squeeze(0)
+        logits = self.pi(out)
+        value = self.v(out).squeeze(-1)
+        return logits, value, (h, c)
+
+
 @dataclass
 class DriftMonitorState:
     e_s: torch.Tensor
@@ -347,7 +399,7 @@ def autocast_context(device: str, enabled: bool, dtype: torch.dtype):
         return contextlib.nullcontext()
     if torch.device(device).type != "cuda":
         return contextlib.nullcontext()
-    return amp.autocast(device_type="cuda", dtype=dtype)
+    return torch.amp.autocast("cuda", dtype=dtype)
 
 
 @torch.no_grad()
@@ -493,6 +545,75 @@ def rollout(
     return batch, obs, prev_action, traces
 
 
+@torch.no_grad()
+def rollout_recurrent(
+    envs: EnvPool,
+    ac: RecurrentActorCritic,
+    device: str,
+    horizon: int,
+    gamma: float,
+    obs: np.ndarray,
+    prev_action: torch.Tensor,
+    hidden: tuple[torch.Tensor, torch.Tensor],
+):
+    n_envs = envs.num_envs
+    obs_buf = torch.zeros((horizon, n_envs, obs.shape[-1]), device=device)
+    prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+    act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+    logp_buf = torch.zeros((horizon, n_envs), device=device)
+    val_buf = torch.zeros((horizon, n_envs), device=device)
+    rew_buf = torch.zeros((horizon, n_envs), device=device)
+    done_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
+
+    h, c = hidden
+    h0, c0 = h.clone(), c.clone()
+
+    for t in range(horizon):
+        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32)
+        obs_buf[t] = obs_t
+        prev_a_buf[t] = prev_action
+
+        logits, value, (h, c) = ac(obs_t, prev_action, (h, c))
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        logp = dist.log_prob(action)
+        act_buf[t] = action
+        logp_buf[t] = logp
+        val_buf[t] = value
+
+        next_obs, reward, done_env, trunc, _info = envs.step(action.cpu().numpy())
+        done = done_env | trunc
+
+        rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
+        done_buf[t] = torch.as_tensor(done, device=device, dtype=torch.bool)
+
+        # reset hidden state where episodes ended
+        if done.any():
+            done_idx = torch.as_tensor(done, device=device)
+            h[:, done_idx] = 0.0
+            c[:, done_idx] = 0.0
+
+        prev_action = action
+        obs = next_obs
+
+    obs_T = torch.as_tensor(obs, device=device, dtype=torch.float32)
+    logits_T, value_T, (h, c) = ac(obs_T, prev_action, (h, c))
+
+    batch = {
+        "obs": obs_buf,
+        "prev_action": prev_a_buf,
+        "actions": act_buf,
+        "logp_old": logp_buf,
+        "values_old": val_buf,
+        "rewards": rew_buf,
+        "dones": done_buf,
+        "value_T": value_T,
+        "h0": h0,
+        "c0": c0,
+    }
+    return batch, obs, prev_action, (h, c)
+
+
 def compute_gae(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -537,7 +658,7 @@ def ppo_update(
     device: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
-    grad_scaler: amp.GradScaler | None,
+    grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
     obs = batch["obs"]
     prev_a = batch["prev_action"]
@@ -581,7 +702,7 @@ def ppo_update(
         "count": 0.0,
     }
     for _ in range(epochs):
-        perm = idx[torch.randperm(b, generator=generator)]
+        perm = idx[torch.randperm(b, generator=generator, device=idx.device)]
         for start in range(0, b, minibatch_size):
             mb = perm[start : start + minibatch_size]
 
@@ -637,6 +758,204 @@ def ppo_update(
     return stats
 
 
+def ppo_update_recurrent(
+    ac: RecurrentActorCritic,
+    opt: torch.optim.Optimizer,
+    batch: dict,
+    clip_coef: float,
+    vf_coef: float,
+    ent_coef: float,
+    epochs: int,
+    lam: float,
+    gamma: float,
+    generator: torch.Generator,
+    device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    grad_scaler: torch.amp.GradScaler | None,
+) -> dict[str, float]:
+    obs = batch["obs"]
+    prev_a = batch["prev_action"]
+    actions = batch["actions"]
+    logp_old = batch["logp_old"]
+    values_old = batch["values_old"]
+    rewards = batch["rewards"]
+    dones = batch["dones"]
+    h0 = batch["h0"]
+    c0 = batch["c0"]
+    value_T = batch["value_T"]
+
+    resets = torch.zeros_like(dones)
+    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
+    T, N = rewards.shape
+    adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+
+    env_idx = torch.arange(N, device=obs.device)
+    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "count": 0.0}
+
+    for _ in range(epochs):
+        perm_env = env_idx[torch.randperm(N, generator=generator, device=env_idx.device)]
+        for env_id in perm_env:
+            h = h0[:, env_id : env_id + 1].detach()
+            c = c0[:, env_id : env_id + 1].detach()
+
+            traj_logp = []
+            traj_values = []
+            traj_entropy = []
+
+            for t in range(T):
+                with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
+                    logits, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
+                    dist = Categorical(logits=logits)
+                    lp = dist.log_prob(actions[t, env_id : env_id + 1]).squeeze(-1)
+                    traj_logp.append(lp)
+                    traj_values.append(value)
+                    traj_entropy.append(dist.entropy().mean())
+
+            values_all = torch.cat(traj_values, dim=0).squeeze(-1)
+            logp_all = torch.stack(traj_logp, dim=0)
+            entropy = torch.stack(traj_entropy, dim=0).mean()
+
+            ratio = (logp_all - logp_old[:, env_id]).exp()
+            pg1 = ratio * adv[:, env_id]
+            pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv[:, env_id]
+            policy_loss = -torch.min(pg1, pg2).mean()
+
+            value_loss = 0.5 * (returns[:, env_id] - values_all).pow(2).mean()
+            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+
+            opt.zero_grad(set_to_none=True)
+            if grad_scaler is not None and grad_scaler.is_enabled():
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
+                grad_scaler.step(opt)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
+                opt.step()
+
+            with torch.no_grad():
+                approx_kl = (logp_old[:, env_id] - logp_all).mean()
+                clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
+
+            L = T
+            stats["policy_loss"] += policy_loss.item() * L
+            stats["value_loss"] += value_loss.item() * L
+            stats["entropy"] += entropy.item() * L
+            stats["approx_kl"] += approx_kl.item() * L
+            stats["clipfrac"] += clipfrac.item() * L
+            stats["count"] += L
+
+    for k in stats:
+        if k != "count":
+            stats[k] /= max(stats["count"], 1.0)
+    stats.pop("count", None)
+    return stats
+
+
+def train_recurrent(
+    args,
+    envs: EnvPool,
+    obs0: np.ndarray,
+    obs_dim: int,
+    act_dim: int,
+    device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    grad_scaler: torch.amp.GradScaler | None,
+):
+    ac = RecurrentActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=args.act_embed_dim,
+        hidden_dim=args.hidden_dim,
+        feat_dim=args.feat_dim,
+    ).to(device)
+    opt = torch.optim.Adam(ac.parameters(), lr=args.lr)
+
+    updates = args.total_steps // (args.num_envs * args.horizon)
+    rng = torch.Generator(device=device)
+    rng.manual_seed(args.seed)
+
+    prev_action = torch.zeros(args.num_envs, device=device, dtype=torch.int64)
+    hidden = ac.init_hidden(args.num_envs, device)
+    obs = obs0
+
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError("wandb is not installed. Run `pip install wandb` or disable --wandb.")
+        tags = parse_strs(args.wandb_tags)
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            tags=tags or None,
+            mode=args.wandb_mode,
+            dir=args.wandb_dir,
+            config=vars(args),
+        )
+
+    try:
+        for upd in range(updates):
+            batch, obs, prev_action, hidden = rollout_recurrent(
+                envs=envs,
+                ac=ac,
+                device=device,
+                horizon=args.horizon,
+                gamma=args.gamma,
+                obs=obs,
+                prev_action=prev_action,
+                hidden=hidden,
+            )
+
+            ppo_stats = ppo_update_recurrent(
+                ac=ac,
+                opt=opt,
+                batch=batch,
+                clip_coef=args.clip_coef,
+                vf_coef=args.vf_coef,
+                ent_coef=args.ent_coef,
+                epochs=args.epochs,
+                lam=args.gae_lam,
+                gamma=args.gamma,
+                generator=rng,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                grad_scaler=grad_scaler,
+            )
+
+            metrics = {
+                "loop/update": upd + 1,
+                "loop/frames": (upd + 1) * args.num_envs * args.horizon,
+            }
+            metrics.update({f"loss/{k}": v for k, v in ppo_stats.items()})
+
+            mean_ret = mean_len = None
+            if len(envs.episode_returns) > 0:
+                recent = envs.episode_returns[-50:]
+                mean_ret = sum(r for r, _ in recent) / len(recent)
+                mean_len = sum(l for _, l in recent) / len(recent)
+                metrics["train/ret50"] = mean_ret
+                metrics["train/len50"] = mean_len
+
+            if (upd + 1) % args.log_interval == 0 and mean_ret is not None:
+                print(
+                    f"update={upd+1:04d}  episodes={len(envs.episode_returns):06d}  "
+                    f"ret50={mean_ret:8.2f}  len50={mean_len:6.1f}  "
+                    f"kl={ppo_stats['approx_kl']:7.4f}  clipfrac={ppo_stats['clipfrac']:6.3f}"
+                )
+
+            if wandb_run is not None:
+                wandb_run.log(metrics, step=metrics["loop/frames"])
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+
 def make_env_fn(
     env_id: str,
     seed: int,
@@ -665,13 +984,19 @@ def make_env_fn(
 
 
 def main():
+    load_env_file()
+    default_device = os.environ.get("AMT_DEVICE") or os.environ.get("DEVICE") or "cpu"
+
     p = argparse.ArgumentParser()
+    p.add_argument("--config", type=str, default=None, help="YAML config file to override defaults.")
     p.add_argument("--env-id", type=str, default="CartPole-v1")
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--num-envs", type=int, default=8)
     p.add_argument("--horizon", type=int, default=128)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--device", type=str, default=default_device)
+    p.add_argument("--cuda-id", type=int, default=None, help="CUDA device index override (e.g., 0-7).")
+    p.add_argument("--policy", type=str, default="amt", choices=["amt", "recurrent", "ff"], help="Policy architecture.")
 
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--feat-dim", type=int, default=64)
@@ -726,16 +1051,34 @@ def main():
     p.add_argument("--amp", action="store_true", help="Enable mixed precision training (CUDA only).")
     p.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
 
+    # two-pass parse to apply YAML defaults then allow CLI overrides
+    partial_args, _ = p.parse_known_args()
+    if partial_args.config is not None:
+        config_path = Path(partial_args.config)
+        if config_path.exists():
+            cfg = yaml.safe_load(config_path.read_text()) or {}
+            if not isinstance(cfg, dict):
+                raise ValueError("Config file must map keys to values.")
+            p.set_defaults(**{k: v for k, v in cfg.items() if hasattr(partial_args, k)})
+        else:
+            raise FileNotFoundError(f"Config file not found: {config_path}")
     args = p.parse_args()
     set_seed(args.seed)
 
-    device = args.device
+    device = resolve_device(args.device, args.cuda_id)
     device_type = torch.device(device).type
     amp_dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
     use_amp = args.amp and device_type == "cuda"
     if args.amp and not use_amp:
         print("Warning: --amp requested but device is not CUDA; disabling mixed precision.")
-    grad_scaler = amp.GradScaler(enabled=use_amp and (amp_dtype == torch.float16))
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=use_amp and (amp_dtype == torch.float16))
+
+    if args.policy == "ff":
+        args.alpha_base = "1.0"
+        args.alpha_max = "1.0"
+        args.reset_strategy = "none"
+        args.lambda_pred = 0.0
+        args.pred_coef = 0.0
     alpha_base_list = parse_floats(args.alpha_base)
     alpha_max_list = parse_floats(args.alpha_max)
     assert len(alpha_base_list) == len(alpha_max_list)
@@ -763,6 +1106,20 @@ def main():
     act_dim = int(envs.single_action_space.n)
     feat_dim = args.feat_dim
     mem_dim = M * feat_dim
+
+    if args.policy == "recurrent":
+        train_recurrent(
+            args=args,
+            envs=envs,
+            obs0=obs0,
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            grad_scaler=grad_scaler,
+        )
+        return
 
     ac = ActorCritic(
         obs_dim=obs_dim,
