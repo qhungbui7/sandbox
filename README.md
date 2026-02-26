@@ -1,6 +1,6 @@
 # amt
 
-Adaptive Memory Traces (AMT) is a compact research playground that tests how well a PPO-style agent can react to non-stationary dynamics. The single entry point, `amg.py`, wires together partial observability wrappers, a piecewise drift generator, a recurrent-style memory made from exponential traces, and an adaptive drift monitor. The script now also exposes first-class Weights & Biases (W&B) telemetry and optional CUDA mixed precision so you can diagnose and optimize long trainings without touching the core logic.
+Adaptive Memory Traces (AMT) is a compact research playground that tests how well a PPO-style agent can react to non-stationary dynamics. The single entry point, `amg.py`, wires together partial observability wrappers, a piecewise drift generator, a recurrent-style memory made from exponential traces, and an adaptive drift monitor.
 
 ## How the training stack fits together
 
@@ -61,7 +61,7 @@ This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on
 | `--amp`, `--amp-dtype` | CUDA mixed precision (half precision or bfloat16). |
 | `--log-interval` | How often (in updates) to print the rolling metrics. |
 | `--cuda-id` | Explicit CUDA device index (e.g., 0–7) to pin the run to a specific GPU. |
-| `--config` | YAML file to override defaults. CLI flags still win. |
+| `--config` / `<config.yaml>` | YAML file to override defaults (flag or positional). CLI flags still win. |
 | `--policy` | `amt` (default), `recurrent` (LSTM core), or `ff` (feed-forward PPO proxy). |
 
 ## W&B logging guide
@@ -78,6 +78,12 @@ W&B logging is optional—trying to enable it without the package installed rais
 
 ## Baseline variants (paper runs)
 
+Configs are organized per environment under `configs/<env>/` (e.g., `configs/cartpole/`, `configs/acrobot/`). You can run directly with a YAML file as the only argument, e.g.:
+
+```bash
+python3 amg.py configs/cartpole/amt.yaml
+```
+
 Use `run_paper.sh` to launch the baselines with consistent seeds and W&B logging. Examples:
 
 ```bash
@@ -91,17 +97,17 @@ SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-ff
 SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-fixed-trace
 
 # Recurrent PPO (LSTM core, no trace memory) via policy flag
-python3 amg.py --policy recurrent --config configs/recurrent_cartpole.yaml
+python3 amg.py --policy recurrent --config configs/cartpole/recurrent.yaml
 
 # YAML-driven single runs (no bash wrapper)
 # Baseline AMT
-python3 amg.py --config configs/amt_cartpole.yaml --wandb --wandb-run-name amt_s0 --seed 0
+python3 amg.py configs/cartpole/amt.yaml --wandb --wandb-run-name amt_s0 --seed 0
 # Ablations
-python3 amg.py --config configs/no_amp_cartpole.yaml --wandb --wandb-run-name no_amp_s0 --seed 0
-python3 amg.py --config configs/no_pred_cartpole.yaml --wandb --wandb-run-name no_pred_s0 --seed 0
-python3 amg.py --config configs/zero_reset_cartpole.yaml --wandb --wandb-run-name zero_reset_s0 --seed 0
-python3 amg.py --config configs/ppo_ff_cartpole.yaml --wandb --wandb-run-name ppo_ff_s0 --seed 0
-python3 amg.py --config configs/ppo_fixed_trace_cartpole.yaml --wandb --wandb-run-name ppo_fixed_s0 --seed 0
+python3 amg.py configs/cartpole/no_amp.yaml --wandb --wandb-run-name no_amp_s0 --seed 0
+python3 amg.py configs/cartpole/no_pred.yaml --wandb --wandb-run-name no_pred_s0 --seed 0
+python3 amg.py configs/cartpole/zero_reset.yaml --wandb --wandb-run-name zero_reset_s0 --seed 0
+python3 amg.py configs/cartpole/ppo_ff.yaml --wandb --wandb-run-name ppo_ff_s0 --seed 0
+python3 amg.py configs/cartpole/ppo_fixed_trace.yaml --wandb --wandb-run-name ppo_fixed_s0 --seed 0
 ```
 
 Additional ablations: `no-amp`, `no-pred`, `zero-reset` (see script help).

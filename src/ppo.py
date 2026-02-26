@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+from torch.distributions.categorical import Categorical
 
-from .utils import autocast_context
+from src.models import ActorCritic, Predictor, RecurrentActorCritic
+from src.utils import autocast_context
 
 
 def compute_gae(
@@ -13,22 +14,27 @@ def compute_gae(
     last_value: torch.Tensor,
     gamma: float,
     lam: float,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    rewards, dones, resets, values: (T, N)
+    last_value: (N,)
+    """
     T, N = rewards.shape
-    adv = torch.zeros_like(rewards)
-    lastgaelam = torch.zeros(N, device=rewards.device)
+    adv = torch.zeros((T, N), device=rewards.device)
+    last_gae = torch.zeros(N, device=rewards.device)
     for t in reversed(range(T)):
-        nonterminal = (~dones[t]) & (~resets[t])
-        delta = rewards[t] + gamma * nonterminal * last_value - values[t]
-        lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
-        adv[t] = lastgaelam
-        last_value = values[t]
+        next_value = last_value if t == T - 1 else values[t + 1]
+        nonterminal = (~dones[t]).float()
+        delta = rewards[t] + gamma * nonterminal * next_value - values[t]
+        trunc = (~resets[t]).float()
+        last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
+        adv[t] = last_gae
     returns = adv + values
     return adv, returns
 
 
 def ppo_update(
-    ac,
+    ac: ActorCritic,
     opt: torch.optim.Optimizer,
     batch: dict,
     clip_coef: float,
@@ -38,7 +44,7 @@ def ppo_update(
     minibatch_size: int,
     lam: float,
     gamma: float,
-    pred,
+    pred: Predictor | None,
     pred_coef: float,
     generator: torch.Generator,
     device: str,
@@ -88,7 +94,7 @@ def ppo_update(
         "count": 0.0,
     }
     for _ in range(epochs):
-        perm = idx[torch.randperm(b, generator=generator)]
+        perm = idx[torch.randperm(b, generator=generator, device=idx.device)]
         for start in range(0, b, minibatch_size):
             mb = perm[start : start + minibatch_size]
 
@@ -128,22 +134,24 @@ def ppo_update(
                 approx_kl = (logp_old_f[mb] - logp).mean()
                 clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
 
-            stats["policy_loss"] += policy_loss.item() * len(mb)
-            stats["value_loss"] += value_loss.item() * len(mb)
-            stats["entropy"] += entropy.item() * len(mb)
-            stats["pred_loss"] += pred_loss.item() * len(mb)
-            stats["approx_kl"] += approx_kl.item() * len(mb)
-            stats["clipfrac"] += clipfrac.item() * len(mb)
-            stats["count"] += len(mb)
+            stats["policy_loss"] += policy_loss.detach().item()
+            stats["value_loss"] += value_loss.detach().item()
+            stats["entropy"] += entropy.detach().item()
+            stats["pred_loss"] += pred_loss.detach().item()
+            stats["approx_kl"] += approx_kl.detach().item()
+            stats["clipfrac"] += clipfrac.detach().item()
+            stats["count"] += 1.0
 
-    for k in stats:
+    count = max(stats["count"], 1.0)
+    for k in list(stats.keys()):
         if k != "count":
-            stats[k] /= stats["count"]
+            stats[k] /= count
+    stats.pop("count", None)
     return stats
 
 
 def ppo_update_recurrent(
-    ac,
+    ac: RecurrentActorCritic,
     opt: torch.optim.Optimizer,
     batch: dict,
     clip_coef: float,
@@ -158,7 +166,7 @@ def ppo_update_recurrent(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
-    obs = batch["obs"]  # [T, N, obs_dim]
+    obs = batch["obs"]
     prev_a = batch["prev_action"]
     actions = batch["actions"]
     logp_old = batch["logp_old"]
@@ -172,21 +180,19 @@ def ppo_update_recurrent(
     resets = torch.zeros_like(dones)
     adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
     T, N = rewards.shape
-
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
     env_idx = torch.arange(N, device=obs.device)
     stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "count": 0.0}
 
     for _ in range(epochs):
-        perm_env = env_idx[torch.randperm(N, generator=generator)]
+        perm_env = env_idx[torch.randperm(N, generator=generator, device=env_idx.device)]
         for env_id in perm_env:
             h = h0[:, env_id : env_id + 1].detach()
             c = c0[:, env_id : env_id + 1].detach()
 
-            traj_logits = []
-            traj_values = []
             traj_logp = []
+            traj_values = []
             traj_entropy = []
 
             for t in range(T):
@@ -194,12 +200,10 @@ def ppo_update_recurrent(
                     logits, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
                     dist = Categorical(logits=logits)
                     lp = dist.log_prob(actions[t, env_id : env_id + 1]).squeeze(-1)
-                    traj_logits.append(logits)
-                    traj_values.append(value)
                     traj_logp.append(lp)
+                    traj_values.append(value)
                     traj_entropy.append(dist.entropy().mean())
 
-            logits_all = torch.cat(traj_logits, dim=0)
             values_all = torch.cat(traj_values, dim=0).squeeze(-1)
             logp_all = torch.stack(traj_logp, dim=0)
             entropy = torch.stack(traj_entropy, dim=0).mean()
@@ -210,7 +214,6 @@ def ppo_update_recurrent(
             policy_loss = -torch.min(pg1, pg2).mean()
 
             value_loss = 0.5 * (returns[:, env_id] - values_all).pow(2).mean()
-
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
 
             opt.zero_grad(set_to_none=True)
@@ -239,5 +242,6 @@ def ppo_update_recurrent(
 
     for k in stats:
         if k != "count":
-            stats[k] /= stats["count"]
+            stats[k] /= max(stats["count"], 1.0)
+    stats.pop("count", None)
     return stats
