@@ -1,858 +1,76 @@
 #!/usr/bin/env python3
 import argparse
-import contextlib
-import math
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions.categorical import Categorical
 import yaml
 
 import gymnasium as gym
-
-
 import wandb
 
-
-def load_env_file(path: str | Path | None = None) -> None:
-    """Load key=value pairs from a .env file into os.environ."""
-    env_path = Path(path) if path is not None else Path(__file__).resolve().parent / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and ((value[0] == value[-1]) and value[0] in {'"', "'"}):
-            value = value[1:-1]
-        os.environ[key] = value
-
-
-def resolve_device(device_str: str, cuda_id: int | None) -> str:
-    """Normalize device selection and allow explicit CUDA index override."""
-    if cuda_id is not None:
-        return f"cuda:{cuda_id}"
-    return device_str
-
-
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def one_hot(x: torch.Tensor, n: int) -> torch.Tensor:
-    return F.one_hot(x.long(), n).float()
-
-
-class PartialObsWrapper(gym.ObservationWrapper):
-    def __init__(self, env: gym.Env, mask_indices: list[int]):
-        super().__init__(env)
-        assert isinstance(env.observation_space, gym.spaces.Box)
-        self.mask_indices = np.array(mask_indices, dtype=np.int64)
-        low = env.observation_space.low.copy()
-        high = env.observation_space.high.copy()
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=env.observation_space.dtype)
-
-    def observation(self, observation):
-        obs = np.array(observation, copy=True)
-        obs[..., self.mask_indices] = 0.0
-        return obs
-
-
-class PiecewiseDriftWrapper(gym.Wrapper):
-    def __init__(
-        self,
-        env: gym.Env,
-        seed: int,
-        phase_len: int,
-        obs_shift_scale: float,
-        reward_scale_low: float,
-        reward_scale_high: float,
-    ):
-        super().__init__(env)
-        assert isinstance(env.observation_space, gym.spaces.Box)
-        self.rng = np.random.RandomState(seed)
-        self.phase_len = int(phase_len)
-        self.obs_shift_scale = float(obs_shift_scale)
-        self.reward_scale_low = float(reward_scale_low)
-        self.reward_scale_high = float(reward_scale_high)
-
-        self.t = 0
-        self.phase = 0
-        self.shift = np.zeros(env.observation_space.shape, dtype=np.float32)
-        self.r_scale = 1.0
-
-    def reset(self, *, seed=None, options=None):
-        obs, info = self.env.reset(seed=seed, options=options)
-        self.t = 0
-        self.phase = 0
-        self.shift = self.rng.randn(*obs.shape).astype(np.float32) * self.obs_shift_scale
-        self.r_scale = self.rng.uniform(self.reward_scale_low, self.reward_scale_high)
-        return (obs + self.shift), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self.t += 1
-        if self.phase_len > 0 and (self.t % self.phase_len) == 0:
-            self.phase += 1
-            self.shift = self.rng.randn(*obs.shape).astype(np.float32) * self.obs_shift_scale
-            self.r_scale = self.rng.uniform(self.reward_scale_low, self.reward_scale_high)
-        return (obs + self.shift), (reward * self.r_scale), terminated, truncated, info
-
-
-class EnvPool:
-    def __init__(self, env_fns: list):
-        self.envs = [fn() for fn in env_fns]
-        self.num_envs = len(self.envs)
-        self.single_observation_space = self.envs[0].observation_space
-        self.single_action_space = self.envs[0].action_space
-
-        self._ep_returns = np.zeros(self.num_envs, dtype=np.float32)
-        self._ep_lengths = np.zeros(self.num_envs, dtype=np.int32)
-        self.episode_returns = []
-
-    def reset(self, seed: int):
-        obs = []
-        infos = []
-        for i, env in enumerate(self.envs):
-            o, info = env.reset(seed=seed + i)
-            obs.append(o)
-            infos.append(info)
-            self._ep_returns[i] = 0.0
-            self._ep_lengths[i] = 0
-        return np.stack(obs, axis=0), infos
-
-    def step(self, actions: np.ndarray):
-        obs, rew, term, trunc, infos = [], [], [], [], []
-        for i, env in enumerate(self.envs):
-            o, r, t, tr, info = env.step(int(actions[i]))
-            self._ep_returns[i] += float(r)
-            self._ep_lengths[i] += 1
-            if t or tr:
-                self.episode_returns.append((float(self._ep_returns[i]), int(self._ep_lengths[i])))
-                self._ep_returns[i] = 0.0
-                self._ep_lengths[i] = 0
-                o, info_reset = env.reset()
-                info["reset_info"] = info_reset
-            obs.append(o)
-            rew.append(r)
-            term.append(t)
-            trunc.append(tr)
-            infos.append(info)
-        return (
-            np.stack(obs, axis=0),
-            np.asarray(rew, dtype=np.float32),
-            np.asarray(term, dtype=np.bool_),
-            np.asarray(trunc, dtype=np.bool_),
-            infos,
-        )
-
-
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, activation=nn.Tanh):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            activation(),
-            nn.Linear(hidden_dim, hidden_dim),
-            activation(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class FeatureEncoder(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, act_embed_dim: int, hidden_dim: int, feat_dim: int):
-        super().__init__()
-        self.act_emb = nn.Embedding(act_dim, act_embed_dim)
-        self.mlp = MLP(obs_dim + act_embed_dim, hidden_dim, feat_dim, activation=nn.Tanh)
-
-    def forward(self, obs: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
-        a = self.act_emb(prev_action.long())
-        x = torch.cat([obs, a], dim=-1)
-        return self.mlp(x)
-
-
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, act_embed_dim: int, hidden_dim: int, feat_dim: int, mem_dim: int):
-        super().__init__()
-        self.f_pol = FeatureEncoder(obs_dim, act_dim, act_embed_dim, hidden_dim, feat_dim)
-        self.core = MLP(feat_dim + mem_dim, hidden_dim, hidden_dim, activation=nn.Tanh)
-        self.pi = nn.Linear(hidden_dim, act_dim)
-        self.v = nn.Linear(hidden_dim, 1)
-
-    def forward(
-        self, obs: torch.Tensor, prev_action: torch.Tensor, traces_flat: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x_pol = self.f_pol(obs, prev_action)
-        h = self.core(torch.cat([x_pol, traces_flat], dim=-1))
-        logits = self.pi(h)
-        value = self.v(h).squeeze(-1)
-        return logits, value
-
-
-class Predictor(nn.Module):
-    def __init__(self, feat_dim: int, act_dim: int, hidden_dim: int):
-        super().__init__()
-        self.act_emb = nn.Embedding(act_dim, hidden_dim)
-        self.net = MLP(feat_dim + hidden_dim, hidden_dim, feat_dim, activation=nn.Tanh)
-
-    def forward(self, x_mem: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        a = self.act_emb(action.long())
-        return self.net(torch.cat([x_mem, a], dim=-1))
-
-
-class RecurrentActorCritic(nn.Module):
-    """PPO policy with an LSTM core (no external trace memory)."""
-
-    def __init__(self, obs_dim: int, act_dim: int, act_embed_dim: int, hidden_dim: int, feat_dim: int):
-        super().__init__()
-        self.f_pol = FeatureEncoder(obs_dim, act_dim, act_embed_dim, hidden_dim, feat_dim)
-        self.lstm = nn.LSTM(input_size=feat_dim, hidden_size=hidden_dim, num_layers=1)
-        self.pi = nn.Linear(hidden_dim, act_dim)
-        self.v = nn.Linear(hidden_dim, 1)
-
-    def init_hidden(self, batch_size: int, device: str):
-        h = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
-        c = torch.zeros(1, batch_size, self.lstm.hidden_size, device=device)
-        return h, c
-
-    def forward(
-        self, obs: torch.Tensor, prev_action: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        x = self.f_pol(obs, prev_action)  # [B, feat]
-        x = x.unsqueeze(0)  # [1, B, feat]
-        out, (h, c) = self.lstm(x, hidden)
-        out = out.squeeze(0)
-        logits = self.pi(out)
-        value = self.v(out).squeeze(-1)
-        return logits, value, (h, c)
-
-
-@dataclass
-class DriftMonitorState:
-    e_s: torch.Tensor
-    e_l: torch.Tensor
-    mu: torch.Tensor
-    var: torch.Tensor
-    gate: torch.Tensor
-    pers: torch.Tensor
-    cooldown: torch.Tensor
-    rearm: torch.Tensor
-
-
-class DriftMonitor:
-    def __init__(
-        self,
-        num_envs: int,
-        rho_s: float,
-        rho_l: float,
-        beta: float,
-        tau_soft: float,
-        kappa: float,
-        tau_on: float,
-        tau_off: float,
-        K: int,
-        cooldown_steps: int,
-        warmup_steps: int,
-        eps: float = 1e-8,
-        device: str = "cpu",
-    ):
-        self.num_envs = num_envs
-        self.rho_s = float(rho_s)
-        self.rho_l = float(rho_l)
-        self.beta = float(beta)
-        self.tau_soft = float(tau_soft)
-        self.kappa = float(kappa)
-        self.tau_on = float(tau_on)
-        self.tau_off = float(tau_off)
-        self.K = int(K)
-        self.cooldown_steps = int(cooldown_steps)
-        self.warmup_steps = int(warmup_steps)
-        self.eps = float(eps)
-        self.device = device
-
-        self.state = DriftMonitorState(
-            e_s=torch.zeros(num_envs, device=device),
-            e_l=torch.zeros(num_envs, device=device),
-            mu=torch.zeros(num_envs, device=device),
-            var=torch.ones(num_envs, device=device),
-            gate=torch.zeros(num_envs, device=device),
-            pers=torch.zeros(num_envs, device=device, dtype=torch.int32),
-            cooldown=torch.zeros(num_envs, device=device, dtype=torch.int32),
-            rearm=torch.ones(num_envs, device=device, dtype=torch.bool),
-        )
-        self.step_idx = 0
-
-    def reset_where(self, mask: torch.Tensor) -> None:
-        s = self.state
-        s.e_s[mask] = 0.0
-        s.e_l[mask] = 0.0
-        s.mu[mask] = 0.0
-        s.var[mask] = 1.0
-        s.gate[mask] = 0.0
-        s.pers[mask] = 0
-        s.cooldown[mask] = 0
-        s.rearm[mask] = True
-
-    def update(self, e: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          gate: (num_envs,)
-          reset_event: (num_envs,) bool
-        """
-        s = self.state
-
-        s.e_s = (1.0 - self.rho_s) * s.e_s + self.rho_s * e
-        s.e_l = (1.0 - self.rho_l) * s.e_l + self.rho_l * e
-
-        d = (s.e_s - s.e_l) / (s.e_l + self.eps)
-
-        mu_next = (1.0 - self.beta) * s.mu + self.beta * d
-        var_next = (1.0 - self.beta) * s.var + self.beta * (d - mu_next).pow(2)
-        s.mu = mu_next
-        s.var = var_next
-
-        z = (d - s.mu) / torch.sqrt(s.var + self.eps)
-
-        s.gate = torch.sigmoid((z - self.tau_soft) / self.kappa)
-
-        if self.step_idx < self.warmup_steps:
-            s.pers[:] = 0
-            s.cooldown[:] = 0
-            s.rearm[:] = True
-            self.step_idx += 1
-            return s.gate, torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-
-        s.cooldown = torch.clamp(s.cooldown - 1, min=0)
-
-        rearm_mask = z < self.tau_off
-        s.rearm[rearm_mask] = True
-
-        active = s.rearm & (z > self.tau_on)
-        s.pers[active] += 1
-        s.pers[~active] = 0
-
-        trigger = (s.pers >= self.K) & (s.cooldown == 0) & s.rearm
-        s.pers[trigger] = 0
-        s.rearm[trigger] = False
-        s.cooldown[trigger] = self.cooldown_steps
-
-        self.step_idx += 1
-        return s.gate, trigger
-
-
-def ema_update_(target: nn.Module, source: nn.Module, tau: float) -> None:
-    for tp, sp in zip(target.parameters(), source.parameters(), strict=True):
-        tp.data.mul_(tau).add_(sp.data, alpha=(1.0 - tau))
-
-
-def trace_update(z: torch.Tensor, x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    """
-    z: (n_envs, M, d)
-    x: (n_envs, d)
-    alpha: (n_envs, M)
-    """
-    a = alpha.unsqueeze(-1)
-    return (1.0 - a) * z + a * x.unsqueeze(1)
-
-
-def apply_reset(z: torch.Tensor, x_next: torch.Tensor, strategy: str, long_mask: torch.Tensor) -> torch.Tensor:
-    if strategy == "zero":
-        return torch.zeros_like(z)
-    if strategy == "obs":
-        return x_next.unsqueeze(1).expand_as(z).clone()
-    if strategy == "partial":
-        out = z.clone()
-        out[:, long_mask] = 0.0
-        return out
-    raise ValueError(f"Unknown reset strategy: {strategy}")
-
-
-def parse_floats(s: str) -> list[float]:
-    return [float(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def parse_ints(s: str) -> list[int]:
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def parse_strs(s: str) -> list[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-def autocast_context(device: str, enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return contextlib.nullcontext()
-    if torch.device(device).type != "cuda":
-        return contextlib.nullcontext()
-    return torch.amp.autocast("cuda", dtype=dtype)
-
-
-@torch.no_grad()
-def rollout(
-    envs: EnvPool,
-    ac: ActorCritic,
-    f_mem: FeatureEncoder,
-    drift: DriftMonitor,
-    predictor: Predictor | None,
-    device: str,
-    horizon: int,
-    gamma: float,
-    lambda_pred: float,
-    alpha_base: torch.Tensor,
-    alpha_max: torch.Tensor,
-    reset_strategy: str,
-    reset_long_fraction: float,
-    obs: np.ndarray,
-    prev_action: torch.Tensor,
-    traces: torch.Tensor,
-):
-    n_envs = envs.num_envs
-    M = traces.shape[1]
-    d = traces.shape[2]
-
-    obs_buf = torch.zeros((horizon, n_envs, obs.shape[-1]), device=device)
-    prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    trace_buf = torch.zeros((horizon, n_envs, M, d), device=device)
-
-    act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    logp_buf = torch.zeros((horizon, n_envs), device=device)
-    val_buf = torch.zeros((horizon, n_envs), device=device)
-    rew_buf = torch.zeros((horizon, n_envs), device=device)
-    done_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
-    reset_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
-
-    xmem_buf = torch.zeros((horizon, n_envs, d), device=device)
-    xmem_next_buf = torch.zeros((horizon, n_envs, d), device=device)
-
-    long_start = int(math.floor((1.0 - reset_long_fraction) * M))
-    long_mask = torch.zeros(M, device=device, dtype=torch.bool)
-    if reset_strategy == "partial":
-        long_mask[long_start:] = True
-
-    for t in range(horizon):
-        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32)
-        obs_buf[t] = obs_t
-        prev_a_buf[t] = prev_action
-        trace_buf[t] = traces
-
-        logits, value = ac(obs_t, prev_action, traces.reshape(n_envs, -1))
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-
-        act_buf[t] = action
-        logp_buf[t] = logp
-        val_buf[t] = value
-
-        next_obs, reward, terminated, truncated, _ = envs.step(action.cpu().numpy())
-        done_env = terminated | truncated
-
-        rew = torch.as_tensor(reward, device=device, dtype=torch.float32)
-        done = torch.as_tensor(done_env, device=device, dtype=torch.bool)
-        rew_buf[t] = rew
-        done_buf[t] = done
-
-        x_mem_t = f_mem(obs_t, prev_action)
-        x_mem_t = F.layer_norm(x_mem_t, (x_mem_t.shape[-1],))
-        xmem_buf[t] = x_mem_t
-
-        next_obs_t = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
-        next_prev_action = action
-
-        x_mem_next = f_mem(next_obs_t, next_prev_action)
-        x_mem_next = F.layer_norm(x_mem_next, (x_mem_next.shape[-1],))
-        xmem_next_buf[t] = x_mem_next
-
-        logits_next, v_next_prov = ac(next_obs_t, next_prev_action, trace_update(
-            traces, x_mem_next, alpha_base.expand(n_envs, -1)
-        ).reshape(n_envs, -1))
-
-        delta_prov = rew + gamma * (~done).float() * v_next_prov - value
-        pred_err = torch.zeros(n_envs, device=device)
-        if (predictor is not None) and (lambda_pred > 0.0):
-            x_hat = predictor(x_mem_t, action)
-            pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
-
-        e = delta_prov.abs() + lambda_pred * pred_err
-
-        gate, reset_event = drift.update(e)
-        reset_event = reset_event & (~done)
-
-        reset_buf[t] = reset_event
-
-        alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
-        alpha = alpha.clamp(0.0, 1.0)
-
-        traces_reset = traces
-        if reset_strategy != "none":
-            traces_reset = traces_reset.clone()
-            if reset_strategy == "zero" or reset_strategy == "obs":
-                traces_reset[reset_event] = apply_reset(traces_reset[reset_event], x_mem_next[reset_event], reset_strategy, long_mask)
-            elif reset_strategy == "partial":
-                traces_reset[reset_event] = apply_reset(traces_reset[reset_event], x_mem_next[reset_event], reset_strategy, long_mask)
-
-        traces_next = trace_update(traces_reset, x_mem_next, alpha)
-
-        done_mask = done
-        if done_mask.any():
-            drift.reset_where(done_mask)
-            traces_next[done_mask] = 0.0
-            traces_next[done_mask] = trace_update(
-                traces_next[done_mask],
-                x_mem_next[done_mask],
-                alpha_base.expand(done_mask.sum(), -1),
-            )
-
-        traces = traces_next
-        prev_action = next_prev_action
-        obs = next_obs
-
-    obs_T = torch.as_tensor(obs, device=device, dtype=torch.float32)
-    logits_T, value_T = ac(obs_T, prev_action, traces.reshape(n_envs, -1))
-
-    batch = {
-        "obs": obs_buf,
-        "prev_action": prev_a_buf,
-        "traces": trace_buf,
-        "actions": act_buf,
-        "logp_old": logp_buf,
-        "values_old": val_buf,
-        "rewards": rew_buf,
-        "dones": done_buf,
-        "resets": reset_buf,
-        "x_mem": xmem_buf,
-        "x_mem_next": xmem_next_buf,
-        "value_T": value_T,
-        "obs_last": obs_T,
-        "prev_action_last": prev_action,
-        "traces_last": traces,
-    }
-    return batch, obs, prev_action, traces
-
-
-@torch.no_grad()
-def rollout_recurrent(
-    envs: EnvPool,
-    ac: RecurrentActorCritic,
-    device: str,
-    horizon: int,
-    gamma: float,
-    obs: np.ndarray,
-    prev_action: torch.Tensor,
-    hidden: tuple[torch.Tensor, torch.Tensor],
-):
-    n_envs = envs.num_envs
-    obs_buf = torch.zeros((horizon, n_envs, obs.shape[-1]), device=device)
-    prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    logp_buf = torch.zeros((horizon, n_envs), device=device)
-    val_buf = torch.zeros((horizon, n_envs), device=device)
-    rew_buf = torch.zeros((horizon, n_envs), device=device)
-    done_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
-
-    h, c = hidden
-    h0, c0 = h.clone(), c.clone()
-
-    for t in range(horizon):
-        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32)
-        obs_buf[t] = obs_t
-        prev_a_buf[t] = prev_action
-
-        logits, value, (h, c) = ac(obs_t, prev_action, (h, c))
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-        act_buf[t] = action
-        logp_buf[t] = logp
-        val_buf[t] = value
-
-        next_obs, reward, done_env, trunc, _info = envs.step(action.cpu().numpy())
-        done = done_env | trunc
-
-        rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
-        done_buf[t] = torch.as_tensor(done, device=device, dtype=torch.bool)
-
-        # reset hidden state where episodes ended
-        if done.any():
-            done_idx = torch.as_tensor(done, device=device)
-            h[:, done_idx] = 0.0
-            c[:, done_idx] = 0.0
-
-        prev_action = action
-        obs = next_obs
-
-    obs_T = torch.as_tensor(obs, device=device, dtype=torch.float32)
-    logits_T, value_T, (h, c) = ac(obs_T, prev_action, (h, c))
-
-    batch = {
-        "obs": obs_buf,
-        "prev_action": prev_a_buf,
-        "actions": act_buf,
-        "logp_old": logp_buf,
-        "values_old": val_buf,
-        "rewards": rew_buf,
-        "dones": done_buf,
-        "value_T": value_T,
-        "h0": h0,
-        "c0": c0,
-    }
-    return batch, obs, prev_action, (h, c)
-
-
-def compute_gae(
-    rewards: torch.Tensor,
-    dones: torch.Tensor,
-    resets: torch.Tensor,
-    values: torch.Tensor,
-    last_value: torch.Tensor,
-    gamma: float,
-    lam: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    rewards, dones, resets, values: (T, N)
-    last_value: (N,)
-    """
-    T, N = rewards.shape
-    adv = torch.zeros((T, N), device=rewards.device)
-    last_gae = torch.zeros(N, device=rewards.device)
-    for t in reversed(range(T)):
-        next_value = last_value if t == T - 1 else values[t + 1]
-        nonterminal = (~dones[t]).float()
-        delta = rewards[t] + gamma * nonterminal * next_value - values[t]
-        trunc = (~resets[t]).float()
-        last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
-        adv[t] = last_gae
-    returns = adv + values
-    return adv, returns
-
-
-def ppo_update(
-    ac: ActorCritic,
-    opt: torch.optim.Optimizer,
-    batch: dict,
-    clip_coef: float,
-    vf_coef: float,
-    ent_coef: float,
-    epochs: int,
-    minibatch_size: int,
-    lam: float,
-    gamma: float,
-    pred: Predictor | None,
-    pred_coef: float,
-    generator: torch.Generator,
-    device: str,
-    use_amp: bool,
-    amp_dtype: torch.dtype,
-    grad_scaler: torch.amp.GradScaler | None,
-) -> dict[str, float]:
-    obs = batch["obs"]
-    prev_a = batch["prev_action"]
-    traces = batch["traces"]
-    actions = batch["actions"]
-    logp_old = batch["logp_old"]
-    values_old = batch["values_old"]
-    rewards = batch["rewards"]
-    dones = batch["dones"]
-    resets = batch["resets"]
-    value_T = batch["value_T"]
-    x_mem = batch["x_mem"]
-    x_mem_next = batch["x_mem_next"]
-
-    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
-
-    T, N = rewards.shape
-    b = T * N
-
-    obs_f = obs.reshape(b, -1)
-    prev_a_f = prev_a.reshape(b)
-    traces_f = traces.reshape(b, -1)
-    actions_f = actions.reshape(b)
-    logp_old_f = logp_old.reshape(b)
-    values_old_f = values_old.reshape(b)
-    adv_f = adv.reshape(b)
-    returns_f = returns.reshape(b)
-    x_mem_f = x_mem.reshape(b, -1)
-    x_mem_next_f = x_mem_next.reshape(b, -1)
-
-    adv_f = (adv_f - adv_f.mean()) / (adv_f.std(unbiased=False) + 1e-8)
-
-    idx = torch.arange(b, device=obs.device)
-    stats = {
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "pred_loss": 0.0,
-        "approx_kl": 0.0,
-        "clipfrac": 0.0,
-        "count": 0.0,
-    }
-    for _ in range(epochs):
-        perm = idx[torch.randperm(b, generator=generator, device=idx.device)]
-        for start in range(0, b, minibatch_size):
-            mb = perm[start : start + minibatch_size]
-
-            with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(obs_f[mb], prev_a_f[mb], traces_f[mb])
-                dist = Categorical(logits=logits)
-                logp = dist.log_prob(actions_f[mb])
-                entropy = dist.entropy().mean()
-
-                ratio = (logp - logp_old_f[mb]).exp()
-                pg1 = ratio * adv_f[mb]
-                pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_f[mb]
-                policy_loss = -torch.min(pg1, pg2).mean()
-
-                value_loss = 0.5 * (returns_f[mb] - values).pow(2).mean()
-
-                pred_loss = torch.tensor(0.0, device=obs.device)
-                if (pred is not None) and (pred_coef > 0.0):
-                    x_hat = pred(x_mem_f[mb], actions_f[mb])
-                    pred_loss = (x_mem_next_f[mb] - x_hat).pow(2).mean()
-
-                loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
-
-            opt.zero_grad(set_to_none=True)
-            if grad_scaler is not None and grad_scaler.is_enabled():
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
-                grad_scaler.step(opt)
-                grad_scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
-                opt.step()
-
-            with torch.no_grad():
-                approx_kl = (logp_old_f[mb] - logp).mean()
-                clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
-
-            stats["policy_loss"] += policy_loss.detach().item()
-            stats["value_loss"] += value_loss.detach().item()
-            stats["entropy"] += entropy.detach().item()
-            stats["pred_loss"] += pred_loss.detach().item()
-            stats["approx_kl"] += approx_kl.detach().item()
-            stats["clipfrac"] += clipfrac.detach().item()
-            stats["count"] += 1.0
-
-    count = max(stats["count"], 1.0)
-    for k in list(stats.keys()):
-        if k != "count":
-            stats[k] /= count
-    stats.pop("count", None)
-    return stats
-
-
-def ppo_update_recurrent(
-    ac: RecurrentActorCritic,
-    opt: torch.optim.Optimizer,
-    batch: dict,
-    clip_coef: float,
-    vf_coef: float,
-    ent_coef: float,
-    epochs: int,
-    lam: float,
-    gamma: float,
-    generator: torch.Generator,
-    device: str,
-    use_amp: bool,
-    amp_dtype: torch.dtype,
-    grad_scaler: torch.amp.GradScaler | None,
-) -> dict[str, float]:
-    obs = batch["obs"]
-    prev_a = batch["prev_action"]
-    actions = batch["actions"]
-    logp_old = batch["logp_old"]
-    values_old = batch["values_old"]
-    rewards = batch["rewards"]
-    dones = batch["dones"]
-    h0 = batch["h0"]
-    c0 = batch["c0"]
-    value_T = batch["value_T"]
-
-    resets = torch.zeros_like(dones)
-    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
-    T, N = rewards.shape
-    adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
-
-    env_idx = torch.arange(N, device=obs.device)
-    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0, "clipfrac": 0.0, "count": 0.0}
-
-    for _ in range(epochs):
-        perm_env = env_idx[torch.randperm(N, generator=generator, device=env_idx.device)]
-        for env_id in perm_env:
-            h = h0[:, env_id : env_id + 1].detach()
-            c = c0[:, env_id : env_id + 1].detach()
-
-            traj_logp = []
-            traj_values = []
-            traj_entropy = []
-
-            for t in range(T):
-                with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                    logits, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
-                    dist = Categorical(logits=logits)
-                    lp = dist.log_prob(actions[t, env_id : env_id + 1]).squeeze(-1)
-                    traj_logp.append(lp)
-                    traj_values.append(value)
-                    traj_entropy.append(dist.entropy().mean())
-
-            values_all = torch.cat(traj_values, dim=0).squeeze(-1)
-            logp_all = torch.stack(traj_logp, dim=0)
-            entropy = torch.stack(traj_entropy, dim=0).mean()
-
-            ratio = (logp_all - logp_old[:, env_id]).exp()
-            pg1 = ratio * adv[:, env_id]
-            pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv[:, env_id]
-            policy_loss = -torch.min(pg1, pg2).mean()
-
-            value_loss = 0.5 * (returns[:, env_id] - values_all).pow(2).mean()
-            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
-
-            opt.zero_grad(set_to_none=True)
-            if grad_scaler is not None and grad_scaler.is_enabled():
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
-                grad_scaler.step(opt)
-                grad_scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=0.5)
-                opt.step()
-
-            with torch.no_grad():
-                approx_kl = (logp_old[:, env_id] - logp_all).mean()
-                clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
-
-            L = T
-            stats["policy_loss"] += policy_loss.item() * L
-            stats["value_loss"] += value_loss.item() * L
-            stats["entropy"] += entropy.item() * L
-            stats["approx_kl"] += approx_kl.item() * L
-            stats["clipfrac"] += clipfrac.item() * L
-            stats["count"] += L
-
-    for k in stats:
-        if k != "count":
-            stats[k] /= max(stats["count"], 1.0)
-    stats.pop("count", None)
-    return stats
+from src.amt import DriftMonitor, ema_update_, encode_mem, rollout, rollout_recurrent, trace_update
+from src.envs import EnvPool, PartialObsWrapper, PiecewiseDriftWrapper
+from src.models import ActorCritic, FeatureEncoder, Predictor, RecurrentActorCritic
+from src.ppo import ppo_update, ppo_update_recurrent
+from src.utils import load_env_file, resolve_device, set_seed
+
+
+def parse_floats(value) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [float(x) for x in value]
+    if isinstance(value, str):
+        return [float(x.strip()) for x in value.split(",") if x.strip()]
+    return [float(value)]
+
+
+def parse_ints(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(x) for x in value]
+    if isinstance(value, str):
+        return [int(x.strip()) for x in value.split(",") if x.strip()]
+    return [int(value)]
+
+
+def parse_strs(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def init_wandb(args):
+    if not args.wandb:
+        return None
+    if wandb is None:
+        raise RuntimeError("wandb is not installed. Run `pip install wandb` or disable --wandb.")
+    tags = parse_strs(args.wandb_tags)
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        tags=tags or None,
+        mode=args.wandb_mode,
+        dir=args.wandb_dir,
+        config=vars(args),
+    )
+
+
+def recent_return_stats(episode_returns: list[tuple[float, int]], window: int = 50) -> tuple[float | None, float | None]:
+    if not episode_returns:
+        return None, None
+    recent = episode_returns[-window:]
+    mean_ret = sum(r for r, _ in recent) / len(recent)
+    mean_len = sum(l for _, l in recent) / len(recent)
+    return mean_ret, mean_len
 
 
 def train_recurrent(
@@ -883,20 +101,7 @@ def train_recurrent(
     hidden = ac.init_hidden(args.num_envs, device)
     obs = obs0
 
-    wandb_run = None
-    if args.wandb:
-        if wandb is None:
-            raise RuntimeError("wandb is not installed. Run `pip install wandb` or disable --wandb.")
-        tags = parse_strs(args.wandb_tags)
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name,
-            tags=tags or None,
-            mode=args.wandb_mode,
-            dir=args.wandb_dir,
-            config=vars(args),
-        )
+    wandb_run = init_wandb(args)
 
     try:
         for upd in range(updates):
@@ -934,11 +139,8 @@ def train_recurrent(
             }
             metrics.update({f"loss/{k}": v for k, v in ppo_stats.items()})
 
-            mean_ret = mean_len = None
-            if len(envs.episode_returns) > 0:
-                recent = envs.episode_returns[-50:]
-                mean_ret = sum(r for r, _ in recent) / len(recent)
-                mean_len = sum(l for _, l in recent) / len(recent)
+            mean_ret, mean_len = recent_return_stats(envs.episode_returns, window=50)
+            if mean_ret is not None:
                 metrics["train/ret50"] = mean_ret
                 metrics["train/len50"] = mean_len
 
@@ -988,7 +190,8 @@ def main():
     default_device = os.environ.get("AMT_DEVICE") or os.environ.get("DEVICE") or "cpu"
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default=None, help="YAML config file to override defaults.")
+    p.add_argument("--config", type=str, default=None, help="YAML config file (overrides positional config).")
+    p.add_argument("config_path", nargs="?", default=None, help="YAML config file (positional).")
     p.add_argument("--env-id", type=str, default="CartPole-v1")
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--num-envs", type=int, default=8)
@@ -1053,8 +256,11 @@ def main():
 
     # two-pass parse to apply YAML defaults then allow CLI overrides
     partial_args, _ = p.parse_known_args()
-    if partial_args.config is not None:
-        config_path = Path(partial_args.config)
+    if partial_args.config and partial_args.config_path and (partial_args.config != partial_args.config_path):
+        raise ValueError("Provide a single config path (either positional or --config).")
+    config_input = partial_args.config or partial_args.config_path
+    if config_input is not None:
+        config_path = Path(config_input)
         if config_path.exists():
             cfg = yaml.safe_load(config_path.read_text()) or {}
             if not isinstance(cfg, dict):
@@ -1151,8 +357,7 @@ def main():
 
     with torch.no_grad():
         obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
-        x_mem0 = f_mem(obs0_t, prev_action)
-        x_mem0 = F.layer_norm(x_mem0, (x_mem0.shape[-1],))
+        x_mem0 = encode_mem(f_mem, obs0_t, prev_action)
         traces = trace_update(traces, x_mem0, alpha_base.expand(args.num_envs, -1))
 
     drift = DriftMonitor(
@@ -1181,20 +386,7 @@ def main():
     rng.manual_seed(args.seed)
 
     obs = obs0
-    wandb_run = None
-    if args.wandb:
-        if wandb is None:
-            raise RuntimeError("wandb is not installed. Run `pip install wandb` or disable --wandb.")
-        tags = parse_strs(args.wandb_tags)
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name,
-            tags=tags or None,
-            mode=args.wandb_mode,
-            dir=args.wandb_dir,
-            config=vars(args),
-        )
+    wandb_run = init_wandb(args)
 
     try:
         for upd in range(updates):
@@ -1246,11 +438,8 @@ def main():
             }
             metrics.update({f"loss/{k}": v for k, v in ppo_stats.items()})
 
-            mean_ret = mean_len = None
-            if len(envs.episode_returns) > 0:
-                recent = envs.episode_returns[-50:]
-                mean_ret = sum(r for r, _ in recent) / len(recent)
-                mean_len = sum(l for _, l in recent) / len(recent)
+            mean_ret, mean_len = recent_return_stats(envs.episode_returns, window=50)
+            if mean_ret is not None:
                 metrics["train/ret50"] = mean_ret
                 metrics["train/len50"] = mean_len
 
