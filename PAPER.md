@@ -47,9 +47,9 @@ Key implementation details:
 - **No AMP / No Predictor:** ablations on precision and auxiliary loss.
 - **Recurrent PPO:** LSTM core baseline (`policy=recurrent`) with same optimizer/hyperparams.
 
-Config files (CartPole, 500k frames, 8 envs) live under `configs/`:
-`amt_cartpole.yaml`, `no_amp_cartpole.yaml`, `no_pred_cartpole.yaml`, `zero_reset_cartpole.yaml`, `ppo_ff_cartpole.yaml`, `ppo_fixed_trace_cartpole.yaml`, `recurrent_cartpole.yaml`.
-Run via `python3 amg.py --config <file> --seed {0,1,2} --wandb --wandb-run-name <name>`.
+Config files (CartPole, 500k frames, 8 envs) live under `configs/cartpole/`:
+`amt.yaml`, `no_amp.yaml`, `no_pred.yaml`, `zero_reset.yaml`, `ppo_ff.yaml`, `ppo_fixed_trace.yaml`, `recurrent.yaml`.
+Run via `python3 amg.py configs/cartpole/<file> --seed {0,1,2} --wandb --wandb-run-name <name>`.
 
 # 4. Benchmark Plan
 | Component | Purpose | Default Values | Variations to Sweep |

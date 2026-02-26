@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class MLP(nn.Module):
@@ -49,15 +48,14 @@ class ActorCritic(nn.Module):
 
 
 class Predictor(nn.Module):
-    def __init__(self, feat_dim: int, act_dim: int):
+    def __init__(self, feat_dim: int, act_dim: int, hidden_dim: int):
         super().__init__()
-        self.act_emb = nn.Embedding(act_dim, feat_dim)
-        self.mlp = MLP(feat_dim + feat_dim, feat_dim, feat_dim, activation=nn.Tanh)
+        self.act_emb = nn.Embedding(act_dim, hidden_dim)
+        self.net = MLP(feat_dim + hidden_dim, hidden_dim, feat_dim, activation=nn.Tanh)
 
     def forward(self, x_mem: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         a = self.act_emb(action.long())
-        x = torch.cat([x_mem, a], dim=-1)
-        return self.mlp(x)
+        return self.net(torch.cat([x_mem, a], dim=-1))
 
 
 class RecurrentActorCritic(nn.Module):

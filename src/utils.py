@@ -1,9 +1,10 @@
-import os
-import random
-from pathlib import Path
 import contextlib
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def load_env_file(path: str | Path | None = None) -> None:
@@ -31,7 +32,6 @@ def resolve_device(device_str: str, cuda_id: int | None) -> str:
 
 
 def set_seed(seed: int) -> None:
-    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -40,7 +40,7 @@ def set_seed(seed: int) -> None:
 
 
 def one_hot(x: torch.Tensor, n: int) -> torch.Tensor:
-    return torch.nn.functional.one_hot(x.long(), n).float()
+    return F.one_hot(x.long(), n).float()
 
 
 def autocast_context(device: str, enabled: bool, dtype: torch.dtype):
