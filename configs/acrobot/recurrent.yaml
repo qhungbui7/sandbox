@@ -4,7 +4,7 @@ device: cuda
 cuda_id: 0
 num_envs: 8
 horizon: 256
-total_steps: 500000
+total_steps: 501760
 seed: 0
 hidden_dim: 128
 feat_dim: 64

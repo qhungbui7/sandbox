@@ -49,7 +49,8 @@ Key implementation details:
 
 Config files (CartPole, 500k frames, 8 envs) live under `configs/cartpole/`:
 `amt.yaml`, `no_amp.yaml`, `no_pred.yaml`, `zero_reset.yaml`, `ppo_ff.yaml`, `ppo_fixed_trace.yaml`, `recurrent.yaml`.
-Run via `python3 amg.py configs/cartpole/<file> --seed {0,1,2} --wandb --wandb-run-name <name>`.
+
+For the exact single-run commands and paper-style sweeps, use [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md) (or [`run_paper.sh`](run_paper.sh) for multi-seed runs with consistent naming/W&B logging).
 
 # 4. Benchmark Plan
 | Component | Purpose | Default Values | Variations to Sweep |

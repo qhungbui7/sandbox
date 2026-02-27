@@ -2,25 +2,28 @@
 
 Adaptive Memory Traces (AMT) is a compact research playground that tests how well a PPO-style agent can react to non-stationary dynamics. The single entry point, `amg.py`, wires together partial observability wrappers, a piecewise drift generator, a recurrent-style memory made from exponential traces, and an adaptive drift monitor.
 
+## Docs (start here)
+
+- [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md): all copy/paste commands (setup, training, benchmark matrix, plots, gameplay, baseline QA, paper sweeps).
+- [`BENCHMARKS_GUIDE.md`](BENCHMARKS_GUIDE.md): what the benchmark regimes/algorithms mean (beginner friendly).
+- [`EXAMPLE_USE_ALL_UTILITIES.md`](EXAMPLE_USE_ALL_UTILITIES.md): one-command end-to-end smoke run using the repo utilities.
+- [`BASELINE_QA_GUIDE.md`](BASELINE_QA_GUIDE.md): baseline-only questionnaire workflow (PPO-FF + answer sheet generator).
+- [`PAPER.md`](PAPER.md): paper-style overview and experiment plan.
+
 ## How the training stack fits together
 
 1. **Environment wrappers (`PartialObsWrapper`, `PiecewiseDriftWrapper`)** hide state and inject controlled reward/observation shifts to create drift events.  
 2. **`EnvPool`** fans out multiple Gymnasium environments so `rollout` can gather `num_envs × horizon` transitions per update while tracking episode statistics.  
 3. **Representation learning (`FeatureEncoder`, `ActorCritic`, `Predictor`)** embeds observations + previous actions, rolls them into short/long traces, and predicts next embeddings to expose surprise when drift hits.  
 4. **`DriftMonitor`** keeps short/long exponential error averages, opens a gate when the short-term deviation crosses `tau_on`, and triggers trace resets after `K` consecutive alarms (with cooldowns).  
-5. **`rollout` and `ppo_update`** cooperate to gather batches, compute GAE, and optimize PPO with optional auxiliary prediction loss. The PPO step understands AMP autocast + gradient scaling when `--amp` is on.  
+5. **`rollout` + algorithm updater** cooperate to gather batches, compute returns/advantages, and optimize the selected method (`ppo`, `a2c`, `trpo`, `reinforce`, `v-trace`, `v-mpo`, or `dqn`) with optional auxiliary prediction loss.  
 6. **Logging**: console prints summarize the last 50 episode returns, mean trace gate value, KL, and clip fraction. When `--wandb` is set, the same metrics plus loss scalars stream to W&B using the step count `num_envs × horizon × updates`.
 
 Each of these components lives in `amg.py`, so you can trace data flow without jumping between modules.
 
 ## Environment & dependency setup
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install torch gymnasium[classic_control] numpy wandb
-```
+See [`INSTALL.md`](INSTALL.md) for the one-time virtualenv + dependency setup.
 
 > *Note:* Install a CUDA-enabled PyTorch build if you plan to use GPUs or mixed precision.
 
@@ -35,22 +38,41 @@ Load them before running (e.g., `source .env`).
 
 ## Running a baseline experiment
 
+All runnable commands live in [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md) (single runs, matrix sweeps, plots, gameplay, baseline QA, paper sweeps).
+
+Training commands now require:
+- a config path (`amg.py <config.yaml>` or `amg.py --config <path>`)
+- a run note (`--run-note "..."`)
+- use `--run-postfix` when repeating the same setup
+
+Minimal example (one benchmark config):
+
 ```bash
-python3 amg.py \
-  --env-id CartPole-v1 \
+export GPU_ID=0
+export WANDB_PROJECT=amt
+export WANDB_ENTITY=your-team
+export WANDB_DIR=wandb
+export WANDB_MODE=online
+export REPORT_DIR=reports/benchmarks
+
+.venv/bin/python amg.py configs/benchmarks/cartpole/stationary_fullobs.yaml \
+  --algo ppo \
+  --run-note "baseline full training with detailed logging" \
+  --run-postfix "trial1" \
   --device cuda \
-  --num-envs 8 \
-  --total-steps 500000 \
+  --cuda-id ${GPU_ID} \
   --wandb \
-  --wandb-project amt \
-  --wandb-run-name cartpole_amp_demo \
-  --amp \
-  --amp-dtype float16
+  --wandb-project ${WANDB_PROJECT} \
+  --wandb-entity ${WANDB_ENTITY} \
+  --wandb-run-name cartpole_stationary_fullobs_ppo_s0 \
+  --wandb-mode ${WANDB_MODE} \
+  --wandb-dir ${WANDB_DIR} \
+  --report \
+  --report-dir ${REPORT_DIR} \
+  --report-run-name cartpole_stationary_fullobs_ppo_s0
 ```
 
-This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on W&B, and trains with CUDA autocast + gradient scaling. Remove `--wandb` if you only need console output, or set `--device cpu` for local debugging.
-
-### Key CLI flags (see `python3 amg.py --help` for the full list)
+### Key CLI flags (see `.venv/bin/python amg.py --help` for the full list)
 
 | Flag | What it controls |
 | --- | --- |
@@ -58,11 +80,22 @@ This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on
 | `--lambda-pred`, `--pred-coef` | Toggles the auxiliary predictor loss. |
 | `--rho-s`, `--rho-l`, `--tau-on/off`, `--K` | Drift monitor sensitivity and persistence thresholds. |
 | `--wandb`, `--wandb-project`, `--wandb-tags` | Opt-in telemetry to Weights & Biases. |
+| `--cuda-id` + `--wandb` | W&B GPU stats are constrained to the selected target GPU. |
+| `--run-note` | Required run note; saved in logs/summary to differentiate experiments. |
+| `--run-postfix` | Optional postfix appended to report/W&B run names. |
+| `--encoder` | Observation encoder: `mlp` (default) or `cnn` (image-based). |
+| `--early-stop-*` | Optional early stopping (`metric`, `mode`, `patience`, `min_delta`, warmup updates). |
 | `--amp`, `--amp-dtype` | CUDA mixed precision (half precision or bfloat16). |
 | `--log-interval` | How often (in updates) to print the rolling metrics. |
 | `--cuda-id` | Explicit CUDA device index (e.g., 0–7) to pin the run to a specific GPU. |
+| `--env-workers` | Threaded env stepping/reset (helps CPU-heavy envs like `CarRacing-v3`). |
 | `--config` / `<config.yaml>` | YAML file to override defaults (flag or positional). CLI flags still win. |
-| `--policy` | `amt` (default), `recurrent` (LSTM core), or `ff` (feed-forward PPO proxy). |
+| `--policy` | `amt` (default), `recurrent` (LSTM core), or `ff` (feed-forward proxy). |
+| `--algo` | `ppo` (default), `a2c`, `trpo`, `reinforce`, `v-trace`, `v-mpo`, `dqn`. |
+| `--carracing-downsample`, `--carracing-grayscale` | Optional CarRacing observation preprocessing to reduce input size. |
+| `--frame-stack` | Stack last K observations along channel/last axis (recommended with `--encoder cnn`). |
+| `--debug-log` | Enable extra per-update PPO debug diagnostics in `metrics.jsonl`/W&B. |
+| `--tf32`, `--adam-fused`, `--compile` | CUDA speed knobs (use `--no-tf32` / `--no-adam-fused` to disable). |
 
 ## W&B logging guide
 
@@ -72,45 +105,47 @@ This launches an 8-environment PPO job, logs metrics to the `amt-dev` project on
    - `--wandb-entity` routes logs to a specific team.  
    - `--wandb-run-name` and `--wandb-tags` make runs easier to search (comma-separated tags).  
    - `--wandb-mode {online,offline,disabled}` and `--wandb-dir` help when you need air-gapped logging.  
-3. Metrics logged each update: rolling return/length, gate mean, PPO losses, KL, clip fraction, plus the cumulative frame count.
+3. Metrics logged each update: rolling return/length, gate mean, algorithm-specific losses, plus the cumulative frame count.
 
-W&B logging is optional—trying to enable it without the package installed raises a clear error so you know to `pip install wandb`.
+W&B logging is optional; for setup details see [`INSTALL.md`](INSTALL.md).
 
 ## Baseline variants (paper runs)
 
-Configs are organized per environment under `configs/<env>/` (e.g., `configs/cartpole/`, `configs/acrobot/`). You can run directly with a YAML file as the only argument, e.g.:
+Configs live under `configs/<env>/` (e.g., `configs/cartpole/`). Paper-style multi-seed sweeps are launched via `run_paper.sh` (expects `CUDA_ID`, `SEEDS`, `PROJECT`, and `RUN_NOTE`; optional `ENTITY`).
 
-```bash
-python3 amg.py configs/cartpole/amt.yaml
-```
+Copy/paste commands for single runs and sweeps live in [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md).
 
-Use `run_paper.sh` to launch the baselines with consistent seeds and W&B logging. Examples:
+## Benchmark matrix (stationary + non-stationary)
 
-```bash
-# AMT-PPO (adaptive traces, predictor loss, AMP fp16)
-SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh baseline
+Beyond the original non-stationary partial-observation setup, this repo now includes a benchmark matrix under `configs/benchmarks/`:
 
-# Feed-forward PPO proxy (no adaptive memory, no resets/predictor)
-SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-ff
+- `stationary_fullobs`
+- `stationary_partialobs`
+- `nonstationary_fullobs`
+- `nonstationary_partialobs`
 
-# Fixed-trace PPO (multi-timescale traces, no adaptive gating/resets)
-SEEDS="0 1 2" PROJECT=amt ENTITY=bqhung127 bash run_paper.sh ppo-fixed-trace
+for `CartPole-v1`, `Acrobot-v1`, `MountainCar-v0`, and `CarRacing-v3` (via discrete-action wrapper).
 
-# Recurrent PPO (LSTM core, no trace memory) via policy flag
-python3 amg.py --policy recurrent --config configs/cartpole/recurrent.yaml
+The runner script is `scripts/run_benchmark_matrix.py`. It now runs full-training configs by default, auto-generates per-run plots/gameplay, and writes aggregated mean/std/95% CI summaries.
 
-# YAML-driven single runs (no bash wrapper)
-# Baseline AMT
-python3 amg.py configs/cartpole/amt.yaml --wandb --wandb-run-name amt_s0 --seed 0
-# Ablations
-python3 amg.py configs/cartpole/no_amp.yaml --wandb --wandb-run-name no_amp_s0 --seed 0
-python3 amg.py configs/cartpole/no_pred.yaml --wandb --wandb-run-name no_pred_s0 --seed 0
-python3 amg.py configs/cartpole/zero_reset.yaml --wandb --wandb-run-name zero_reset_s0 --seed 0
-python3 amg.py configs/cartpole/ppo_ff.yaml --wandb --wandb-run-name ppo_ff_s0 --seed 0
-python3 amg.py configs/cartpole/ppo_fixed_trace.yaml --wandb --wandb-run-name ppo_fixed_s0 --seed 0
-```
+Detailed beginner guide: [`BENCHMARKS_GUIDE.md`](BENCHMARKS_GUIDE.md). End-to-end smoke workflow: [`EXAMPLE_USE_ALL_UTILITIES.md`](EXAMPLE_USE_ALL_UTILITIES.md).
 
-Additional ablations: `no-amp`, `no-pred`, `zero-reset` (see script help).
+## Training metrics, plots, gameplay videos
+
+Training now logs richer metrics to each reported run folder:
+
+- `metrics.jsonl` (per-update metrics history)
+- `train.log` (console-style update lines)
+- `run_summary.json` (final summary + artifact pointers)
+- `run_summary.json["active_args"]` (filtered active config, separate from full `args`)
+
+`tqdm` progress bars show update progress, FPS, and ETA by default (disable with `--no-tqdm`).
+
+`scripts/plot_training.py` now writes per-run dashboards (`*_dashboard.png`) plus an aggregate smooth-return plot (`comparison_ret50_smooth.png`).
+
+`scripts/summarize_benchmarks.py` now also writes `summary.csv` with derived collapse/instability metrics (KL/clip/value-loss/event fractions and run score).
+
+For plotting (`scripts/plot_training.py`), gameplay (`scripts/record_gameplay.py`), and summary tables (`scripts/summarize_benchmarks.py`), use the commands in [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md).
 
 ## Mixed precision (AMP) details
 
@@ -129,3 +164,5 @@ Mixed precision typically yields a 1.3–1.6× throughput bump on consumer GPUs 
 - **W&B offline runs**: Use `--wandb-mode offline` to buffer logs locally, then run `wandb sync` later.
 
 With these additions the repository now documents how AMT works end-to-end, and you can toggle W&B plus mixed precision straight from the CLI without editing the source again.
+
+Run directories are unique: if `reports/.../<run_name>` already exists, the run errors out. Use a different `--report-run-name` or `--run-postfix`.
