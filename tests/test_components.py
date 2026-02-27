@@ -109,6 +109,7 @@ def test_amt_rollout_and_update_cpu():
         horizon=8,
         gamma=0.99,
         lambda_pred=0.0,
+        obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
         reset_strategy="none",
@@ -171,6 +172,7 @@ def test_recurrent_rollout_and_update_cpu():
         device=device,
         horizon=6,
         gamma=0.99,
+        obs_normalization="none",
         obs=obs0,
         prev_action=prev_action,
         hidden=hidden,
@@ -196,3 +198,32 @@ def test_recurrent_rollout_and_update_cpu():
     for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
         assert key in stats
         assert torch.isfinite(torch.tensor(stats[key]))
+
+
+def test_cnn_encoder_forward_cpu():
+    device = "cpu"
+    batch = 4
+    obs_shape = (48, 48, 3)
+    obs_dim = int(np.prod(obs_shape))
+    act_dim = 5
+    feat_dim = 32
+    hidden_dim = 64
+    M = 2
+    mem_dim = M * feat_dim
+
+    ac = ActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        mem_dim=mem_dim,
+        encoder_type="cnn",
+        obs_shape=obs_shape,
+    ).to(device)
+    prev_action = torch.zeros(batch, device=device, dtype=torch.int64)
+    obs = torch.zeros((batch, *obs_shape), device=device, dtype=torch.float32)
+    traces = torch.zeros((batch, mem_dim), device=device, dtype=torch.float32)
+    logits, value = ac(obs, prev_action, traces)
+    assert logits.shape == (batch, act_dim)
+    assert value.shape == (batch,)

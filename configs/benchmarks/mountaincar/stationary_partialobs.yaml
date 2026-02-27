@@ -1,0 +1,17 @@
+env_id: MountainCar-v0
+algo: ppo
+policy: amt
+device: cuda
+num_envs: 8
+horizon: 128
+total_steps: 400384
+seed: 0
+mask_indices: [1]
+phase_len: 0
+obs_shift_scale: 0.0
+reward_scale_low: 1.0
+reward_scale_high: 1.0
+wandb: false
+report: true
+report_dir: reports/benchmarks
+report_run_name: mountaincar_stationary_partialobs

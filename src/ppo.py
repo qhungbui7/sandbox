@@ -70,7 +70,7 @@ def ppo_update(
     T, N = rewards.shape
     b = T * N
 
-    obs_f = obs.reshape(b, -1)
+    obs_f = obs.reshape((b, *obs.shape[2:]))
     prev_a_f = prev_a.reshape(b)
     traces_f = traces.reshape(b, -1)
     actions_f = actions.reshape(b)
