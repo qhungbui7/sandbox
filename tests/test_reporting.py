@@ -1,0 +1,41 @@
+import json
+from pathlib import Path
+
+import torch
+
+from src.reporting import start_run_report
+
+
+def test_run_reporter_writes_metrics_logs_and_summary(tmp_path: Path):
+    reporter = start_run_report(
+        repo_root=Path(__file__).resolve().parents[1],
+        report_dir=tmp_path / "reports",
+        run_name="unit_report",
+        args={"env_id": "CartPole-v1", "policy": "ff", "algo": "ppo"},
+        device="cpu",
+        obs_dim=4,
+        act_dim=2,
+        mask_indices=[],
+        config_path=None,
+        enabled=True,
+    )
+    reporter.log_metrics({"loop/frames": 16, "train/ret50": 10.0, "perf/eta_sec": 1.0})
+    reporter.log_line("unit test line")
+    ckpt = reporter.save_checkpoint({"x": torch.tensor(1)})
+    reporter.finalize(checkpoint_path=ckpt)
+
+    summary_path = tmp_path / "reports" / "unit_report" / "run_summary.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text())
+    assert summary["training_stats"]["metric_rows"] == 1
+    assert summary["training_stats"]["best_ret50"] == 10.0
+    assert summary["checkpoint"] == str(ckpt)
+    assert summary["active_args"]["policy"] == "ff"
+    assert summary["active_args"]["algo"] == "ppo"
+    assert summary["active_args"]["env_id"] == "CartPole-v1"
+
+    metrics_path = Path(summary["artifacts"]["metrics_jsonl"])
+    logs_path = Path(summary["artifacts"]["logs_txt"])
+    assert metrics_path.exists()
+    assert logs_path.exists()
+    assert "unit test line" in logs_path.read_text()

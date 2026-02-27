@@ -1,10 +1,8 @@
 {
   "python.defaultInterpreterPath": "/raid/nobackup/trustvision/hungbui/workspace/per/amt/.venv/bin/python",
-    "python.analysis.extraPaths": [
-
-
-    ],
-    "livePreview.defaultPreviewPath": "/workspace/mx_card_classifier/data/html/30k_mx_labeling/index.html",
-
-    
+  "python.analysis.extraPaths": [],
+  "livePreview.defaultPreviewPath": "/workspace/mx_card_classifier/data/html/30k_mx_labeling/index.html",
+  "workbench.editorAssociations": {
+    "*.md": "vscode.markdown.preview.editor"
+  }
 }

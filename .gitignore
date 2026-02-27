@@ -210,3 +210,15 @@ __marimo__/
 
 wandb
 *.pdf
+
+reports/
+reports/dev
+reports/plots
+reports/gameplay
+reports/analysis
+*.pt
+paper/
+.vscode/
+command.md
+artifacts/
+plots

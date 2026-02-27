@@ -9,6 +9,7 @@ from torch.distributions.categorical import Categorical
 
 from src.envs import EnvPool
 from src.models import ActorCritic, FeatureEncoder, Predictor, RecurrentActorCritic
+from src.utils import obs_to_tensor
 
 
 @dataclass
@@ -181,6 +182,7 @@ def rollout(
     horizon: int,
     gamma: float,
     lambda_pred: float,
+    obs_normalization: str,
     alpha_base: torch.Tensor,
     alpha_max: torch.Tensor,
     reset_strategy: str,
@@ -193,7 +195,10 @@ def rollout(
     M = traces.shape[1]
     d = traces.shape[2]
 
-    obs_buf = torch.zeros((horizon, n_envs, obs.shape[-1]), device=device)
+    skip_drift = (reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
+    alpha_const = alpha_base.expand(n_envs, -1).clamp(0.0, 1.0) if skip_drift else None
+
+    obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
     prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     trace_buf = torch.zeros((horizon, n_envs, M, d), device=device)
 
@@ -202,6 +207,8 @@ def rollout(
     val_buf = torch.zeros((horizon, n_envs), device=device)
     rew_buf = torch.zeros((horizon, n_envs), device=device)
     done_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
+    term_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
+    trunc_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
     reset_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
 
     xmem_buf = torch.zeros((horizon, n_envs, d), device=device)
@@ -213,7 +220,7 @@ def rollout(
         long_mask[long_start:] = True
 
     for t in range(horizon):
-        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32)
+        obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
         prev_a_buf[t] = prev_action
         trace_buf[t] = traces
@@ -231,43 +238,52 @@ def rollout(
         done_env = terminated | truncated
 
         rew = torch.as_tensor(reward, device=device, dtype=torch.float32)
+        term = torch.as_tensor(terminated, device=device, dtype=torch.bool)
+        trunc = torch.as_tensor(truncated, device=device, dtype=torch.bool)
         done = torch.as_tensor(done_env, device=device, dtype=torch.bool)
         rew_buf[t] = rew
+        term_buf[t] = term
+        trunc_buf[t] = trunc
         done_buf[t] = done
 
         x_mem_t = encode_mem(f_mem, obs_t, prev_action)
         xmem_buf[t] = x_mem_t
 
-        next_obs_t = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
+        next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
         next_prev_action = action
 
         x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
         xmem_next_buf[t] = x_mem_next
 
-        logits_next, v_next_prov = ac(
-            next_obs_t,
-            next_prev_action,
-            trace_update(traces, x_mem_next, alpha_base.expand(n_envs, -1)).reshape(n_envs, -1),
-        )
+        if skip_drift:
+            reset_event = torch.zeros(n_envs, device=device, dtype=torch.bool)
+            reset_buf[t] = reset_event
+            traces_next = trace_update(traces, x_mem_next, alpha_const)
+        else:
+            _, v_next_prov = ac(
+                next_obs_t,
+                next_prev_action,
+                trace_update(traces, x_mem_next, alpha_base.expand(n_envs, -1)).reshape(n_envs, -1),
+            )
 
-        delta_prov = rew + gamma * (~done).float() * v_next_prov - value
-        pred_err = torch.zeros(n_envs, device=device)
-        if (predictor is not None) and (lambda_pred > 0.0):
-            x_hat = predictor(x_mem_t, action)
-            pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
+            delta_prov = rew + gamma * (~done).float() * v_next_prov - value
+            pred_err = torch.zeros(n_envs, device=device)
+            if (predictor is not None) and (lambda_pred > 0.0):
+                x_hat = predictor(x_mem_t, action)
+                pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
 
-        e = delta_prov.abs() + lambda_pred * pred_err
+            e = delta_prov.abs() + lambda_pred * pred_err
 
-        gate, reset_event = drift.update(e)
-        reset_event = reset_event & (~done)
+            gate, reset_event = drift.update(e)
+            reset_event = reset_event & (~done)
 
-        reset_buf[t] = reset_event
+            reset_buf[t] = reset_event
 
-        alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
-        alpha = alpha.clamp(0.0, 1.0)
+            alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
+            alpha = alpha.clamp(0.0, 1.0)
 
-        traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
-        traces_next = trace_update(traces_reset, x_mem_next, alpha)
+            traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
+            traces_next = trace_update(traces_reset, x_mem_next, alpha)
 
         done_mask = done
         if done_mask.any():
@@ -283,7 +299,7 @@ def rollout(
         prev_action = next_prev_action
         obs = next_obs
 
-    obs_T = torch.as_tensor(obs, device=device, dtype=torch.float32)
+    obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
     logits_T, value_T = ac(obs_T, prev_action, traces.reshape(n_envs, -1))
 
     batch = {
@@ -294,6 +310,8 @@ def rollout(
         "logp_old": logp_buf,
         "values_old": val_buf,
         "rewards": rew_buf,
+        "terminated": term_buf,
+        "truncated": trunc_buf,
         "dones": done_buf,
         "resets": reset_buf,
         "x_mem": xmem_buf,
@@ -313,12 +331,13 @@ def rollout_recurrent(
     device: str,
     horizon: int,
     gamma: float,
+    obs_normalization: str,
     obs: np.ndarray,
     prev_action: torch.Tensor,
     hidden: tuple[torch.Tensor, torch.Tensor],
 ):
     n_envs = envs.num_envs
-    obs_buf = torch.zeros((horizon, n_envs, obs.shape[-1]), device=device)
+    obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
     prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     logp_buf = torch.zeros((horizon, n_envs), device=device)
@@ -330,7 +349,7 @@ def rollout_recurrent(
     h0, c0 = h.clone(), c.clone()
 
     for t in range(horizon):
-        obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32)
+        obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
         prev_a_buf[t] = prev_action
 
@@ -356,7 +375,7 @@ def rollout_recurrent(
         prev_action = action
         obs = next_obs
 
-    obs_T = torch.as_tensor(obs, device=device, dtype=torch.float32)
+    obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
     logits_T, value_T, (h, c) = ac(obs_T, prev_action, (h, c))
 
     batch = {
