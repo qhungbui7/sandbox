@@ -1,0 +1,7 @@
+env:
+  env_id: MountainCar-v0
+  mask_indices: [1]
+  phase_len: 0
+  obs_shift_scale: 0.0
+  reward_scale_low: 1.0
+  reward_scale_high: 1.0

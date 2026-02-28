@@ -1,20 +1,30 @@
-env_id: CarRacing-v3
-algo: ppo
-policy: ff
-device: cuda
-num_envs: 8
-env_workers: 2
-horizon: 256
-total_steps: 102400
-carracing_downsample: 2
-carracing_grayscale: true
-seed: 0
-mask_indices: [2]
-phase_len: 1000
-obs_shift_scale: 8.0
-reward_scale_low: 0.8
-reward_scale_high: 1.2
-wandb: false
-report: true
-report_dir: reports/benchmarks
-report_run_name: carracing_nonstationary_partialobs
+config_paths:
+  env: ../../env/benchmarks/carracing/nonstationary_partialobs.yaml
+  model: ../../model/benchmarks/ff_ppo.yaml
+  training: ../../training/benchmarks/carracing_102400.yaml
+  other: ../../other/benchmark_reporting.yaml
+overrides:
+  env:
+    env_id: CarRacing-v3
+    carracing_downsample: 2
+    carracing_grayscale: true
+    mask_indices: [2]
+    phase_len: 1000
+    obs_shift_scale: 8.0
+    reward_scale_low: 0.8
+    reward_scale_high: 1.2
+  model:
+    algo: ppo
+    policy: ff
+  training:
+    num_envs: 8
+    env_workers: 2
+    horizon: 256
+    total_steps: 102400
+  other:
+    device: cuda
+    seed: 0
+    wandb: false
+    report: true
+    report_dir: reports/benchmarks
+    report_run_name: carracing_nonstationary_partialobs

@@ -131,13 +131,20 @@ def run_postprocess(
     *,
     run_name: str,
     report_dir: Path,
-    plot_dir: Path,
-    gameplay_dir: Path,
+    plot_dir: Path | None,
+    gameplay_dir: Path | None,
     gameplay_episodes: int,
     device: str,
     cuda_id: int | None,
     dry_run: bool,
 ) -> None:
+    run_dir = report_dir / run_name
+    resolved_plot_dir = plot_dir if plot_dir is not None else (run_dir / "plots")
+    resolved_gameplay_dir = gameplay_dir if gameplay_dir is not None else (run_dir / "gameplay")
+    if not dry_run:
+        resolved_plot_dir.mkdir(parents=True, exist_ok=True)
+        resolved_gameplay_dir.mkdir(parents=True, exist_ok=True)
+
     plot_cmd = [
         sys.executable,
         "scripts/plot_training.py",
@@ -146,7 +153,7 @@ def run_postprocess(
         "--run-names",
         run_name,
         "--output-dir",
-        str(plot_dir),
+        str(resolved_plot_dir),
     ]
     code = run_command(plot_cmd, dry_run=dry_run)
     if code != 0:
@@ -156,12 +163,12 @@ def run_postprocess(
         sys.executable,
         "scripts/record_gameplay.py",
         "--run-dir",
-        str(report_dir / run_name),
+        str(run_dir),
         "--episodes",
         str(gameplay_episodes),
         "--deterministic",
         "--output-dir",
-        str(gameplay_dir),
+        str(resolved_gameplay_dir),
         "--name",
         run_name,
         "--overwrite",
@@ -250,8 +257,18 @@ def main() -> None:
         default=True,
         help="After each run, generate plots and gameplay videos for inspection.",
     )
-    p.add_argument("--plot-dir", type=str, default=None, help="Plot output dir (default: <report-dir>/plots).")
-    p.add_argument("--gameplay-dir", type=str, default=None, help="Gameplay output dir (default: <report-dir>/gameplay).")
+    p.add_argument(
+        "--plot-dir",
+        type=str,
+        default=None,
+        help="Optional shared plot output dir override. Default is per-run: <report-dir>/<run-name>/plots.",
+    )
+    p.add_argument(
+        "--gameplay-dir",
+        type=str,
+        default=None,
+        help="Optional shared gameplay output dir override. Default is per-run: <report-dir>/<run-name>/gameplay.",
+    )
     p.add_argument("--analysis-dir", type=str, default=None, help="Summary output dir (default: <report-dir>/analysis).")
     p.add_argument("--gameplay-episodes", type=int, default=2, help="Episodes recorded per run when --visualize is enabled.")
     p.add_argument("--dry-run", action="store_true")
@@ -277,8 +294,8 @@ def main() -> None:
     seeds = [int(x) for x in parse_csv(args.seeds, ["0"])]
     report_dir = Path(args.report_dir)
     extra_args = shlex.split(args.extra_args) if args.extra_args else []
-    plot_dir = Path(args.plot_dir) if args.plot_dir else (report_dir / "plots")
-    gameplay_dir = Path(args.gameplay_dir) if args.gameplay_dir else (report_dir / "gameplay")
+    plot_dir = Path(args.plot_dir) if args.plot_dir else None
+    gameplay_dir = Path(args.gameplay_dir) if args.gameplay_dir else None
     analysis_dir = Path(args.analysis_dir) if args.analysis_dir else (report_dir / "analysis")
 
     if args.require_full_training:

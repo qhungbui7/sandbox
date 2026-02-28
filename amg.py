@@ -2,6 +2,7 @@
 import argparse
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -102,6 +103,349 @@ def with_postfix(base: str | None, postfix: str) -> str | None:
     return f"{base_text}_{postfix}"
 
 
+CONFIG_SECTION_KEYS = ("env", "model", "training", "other")
+CONFIG_META_KEYS = {"include", "includes", "inherit", "inherits", "config_paths", "configs", "overrides"}
+
+
+def _resolve_config_ref(raw_ref, *, base_dir: Path) -> Path:
+    if not isinstance(raw_ref, str) or not raw_ref.strip():
+        raise ValueError(f"Config reference must be a non-empty string, got: {raw_ref!r}")
+    ref = Path(raw_ref.strip())
+    if not ref.is_absolute():
+        ref = base_dir / ref
+    return ref.resolve()
+
+
+def _flatten_config_sections(mapping: dict, *, source: Path) -> dict:
+    flat: dict = {}
+    for key, value in mapping.items():
+        if key in CONFIG_META_KEYS:
+            continue
+        if key in CONFIG_SECTION_KEYS:
+            if not isinstance(value, dict):
+                raise ValueError(f"Config section `{key}` in {source} must be a mapping.")
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def load_config_file(config_path: Path, _stack: tuple[Path, ...] = ()) -> tuple[dict, dict]:
+    resolved_path = config_path.resolve()
+    if resolved_path in _stack:
+        chain = " -> ".join(str(p) for p in (*_stack, resolved_path))
+        raise ValueError(f"Cyclic config reference detected: {chain}")
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Config file not found: {resolved_path}")
+    raw_cfg = yaml.safe_load(resolved_path.read_text()) or {}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError(f"Config file must map keys to values: {resolved_path}")
+
+    merged_cfg: dict = {}
+    ancestry = (*_stack, resolved_path)
+
+    include_items: list = []
+    for key in ("includes", "include", "inherits", "inherit"):
+        if key not in raw_cfg:
+            continue
+        raw_items = raw_cfg[key]
+        if raw_items is None:
+            continue
+        if isinstance(raw_items, str):
+            include_items.append(raw_items)
+            continue
+        if not isinstance(raw_items, (list, tuple)):
+            raise ValueError(f"`{key}` in {resolved_path} must be a string or list of strings.")
+        include_items.extend(raw_items)
+    for item in include_items:
+        include_path = _resolve_config_ref(item, base_dir=resolved_path.parent)
+        include_cfg, _ = load_config_file(include_path, ancestry)
+        merged_cfg.update(include_cfg)
+
+    config_paths = raw_cfg.get("config_paths", None)
+    if config_paths is None:
+        config_paths = raw_cfg.get("configs", None)
+    if config_paths is not None:
+        if not isinstance(config_paths, dict):
+            raise ValueError(f"`config_paths` in {resolved_path} must be a mapping.")
+        ordered_keys = [k for k in CONFIG_SECTION_KEYS if k in config_paths]
+        ordered_keys.extend([k for k in config_paths.keys() if k not in ordered_keys])
+        for key in ordered_keys:
+            ref = config_paths[key]
+            if ref is None:
+                continue
+            include_path = _resolve_config_ref(ref, base_dir=resolved_path.parent)
+            include_cfg, _ = load_config_file(include_path, ancestry)
+            merged_cfg.update(include_cfg)
+
+    merged_cfg.update(_flatten_config_sections(raw_cfg, source=resolved_path))
+
+    overrides = raw_cfg.get("overrides", None)
+    if overrides is not None:
+        if not isinstance(overrides, dict):
+            raise ValueError(f"`overrides` in {resolved_path} must be a mapping.")
+        merged_cfg.update(_flatten_config_sections(overrides, source=resolved_path))
+
+    return merged_cfg, raw_cfg
+
+
+def collect_cli_provided_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        for option in action.option_strings:
+            option_to_dest[option] = action.dest
+
+    provided: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest:
+            provided.add(dest)
+    return provided
+
+
+AMT_ONLY_KEYS = {
+    "alpha_base",
+    "alpha_max",
+    "lambda_pred",
+    "pred_coef",
+    "reset_strategy",
+    "reset_long_fraction",
+    "rho_s",
+    "rho_l",
+    "beta",
+    "tau_soft",
+    "kappa",
+    "tau_on",
+    "tau_off",
+    "K",
+    "cooldown_steps",
+    "warmup_steps",
+}
+CARRACING_ONLY_KEYS = {"carracing_downsample", "carracing_grayscale"}
+DRIFT_ONLY_KEYS = {"rho_s", "rho_l", "beta", "tau_soft", "kappa", "tau_on", "tau_off", "K", "cooldown_steps", "warmup_steps"}
+PPO_ONLY_KEYS = {"clip_coef", "vf_clip", "target_kl"}
+TRPO_ONLY_KEYS = {"trpo_max_kl", "trpo_backtrack_coef", "trpo_backtrack_iters", "trpo_value_epochs"}
+VTRACE_ONLY_KEYS = {"vtrace_rho_clip", "vtrace_c_clip"}
+VMPO_ONLY_KEYS = {"vmpo_topk_frac", "vmpo_eta", "vmpo_kl_coef", "vmpo_kl_target"}
+DQN_ONLY_KEYS = {
+    "dqn_replay_size",
+    "dqn_batch_size",
+    "dqn_learning_starts",
+    "dqn_updates_per_iter",
+    "dqn_target_update_interval",
+    "dqn_double",
+    "dqn_eps_start",
+    "dqn_eps_end",
+    "dqn_eps_decay_steps",
+}
+
+
+def validate_no_unknown_config_keys(*, resolved_cfg: dict, parser: argparse.ArgumentParser) -> None:
+    known = {action.dest for action in parser._actions if action.dest and action.dest != argparse.SUPPRESS}
+    unknown = sorted(k for k in resolved_cfg.keys() if k not in known)
+    if unknown:
+        raise ValueError(
+            "Unknown config keys detected (likely typo or unsupported parameter): " + ", ".join(unknown)
+        )
+
+
+def _normalized_key_value(key: str, value):
+    if key == "algo":
+        return normalize_algo_name(str(value))
+    if key in {"policy", "env_id"}:
+        return str(value).strip()
+    return value
+
+
+def validate_no_strange_params(args, *, resolved_cfg: dict, cli_dests: set[str]) -> None:
+    explicit_cfg_keys = {k for k, v in resolved_cfg.items() if v is not None}
+    explicit_keys = explicit_cfg_keys | set(cli_dests)
+
+    # Prevent silent experiment mutation when overriding pinned config identity.
+    conflicts: list[str] = []
+    for key in ("algo", "policy", "env_id"):
+        if key not in cli_dests:
+            continue
+        if key not in resolved_cfg or resolved_cfg.get(key) is None:
+            continue
+        cfg_value = _normalized_key_value(key, resolved_cfg.get(key))
+        arg_value = _normalized_key_value(key, getattr(args, key))
+        if cfg_value != arg_value:
+            conflicts.append(f"{key} (config={resolved_cfg.get(key)!r}, cli={getattr(args, key)!r})")
+    if conflicts:
+        raise ValueError(
+            "CLI overrides conflict with config-pinned identity keys: "
+            + ", ".join(conflicts)
+            + ". Use a matching config instead of overriding these keys."
+        )
+
+    policy = str(args.policy).strip().lower()
+    env_id = str(args.env_id).strip()
+    algo = normalize_algo_name(str(args.algo))
+
+    if not env_id.startswith("CarRacing"):
+        bad_env_keys = sorted(explicit_keys & CARRACING_ONLY_KEYS)
+        if bad_env_keys:
+            raise ValueError(
+                f"CarRacing-only parameters provided for env `{env_id}`: {', '.join(bad_env_keys)}"
+            )
+
+    if policy != "amt":
+        bad_amt_keys = sorted(explicit_keys & AMT_ONLY_KEYS)
+        if bad_amt_keys:
+            raise ValueError(
+                f"AMT-only parameters provided for policy `{policy}`: {', '.join(bad_amt_keys)}"
+            )
+    else:
+        reset_strategy = str(args.reset_strategy).strip().lower()
+        if reset_strategy == "none":
+            bad_reset_keys = sorted(explicit_keys & {"reset_long_fraction"})
+            if bad_reset_keys:
+                raise ValueError(
+                    "Parameters not used with `reset_strategy=none`: " + ", ".join(bad_reset_keys)
+                )
+        skip_drift = (reset_strategy == "none") and _fixed_alpha_config(args.alpha_base, args.alpha_max)
+        if skip_drift:
+            bad_drift_keys = sorted(explicit_keys & (DRIFT_ONLY_KEYS | {"lambda_pred", "pred_coef"}))
+            if bad_drift_keys:
+                raise ValueError(
+                    "Drift/prediction parameters are not used when alpha is fixed and reset strategy is `none`: "
+                    + ", ".join(bad_drift_keys)
+                )
+
+    # Algorithm-specific strictness for explicit CLI args only.
+    algo_only = {
+        "ppo": PPO_ONLY_KEYS,
+        "trpo": TRPO_ONLY_KEYS,
+        "v-trace": VTRACE_ONLY_KEYS,
+        "v-mpo": VMPO_ONLY_KEYS,
+        "dqn": DQN_ONLY_KEYS,
+    }
+    for owner_algo, keys in algo_only.items():
+        if algo == owner_algo:
+            continue
+        bad_cli = sorted(set(cli_dests) & keys)
+        if bad_cli:
+            raise ValueError(
+                f"Parameters not used by `algo={algo}` (owned by `{owner_algo}`): {', '.join(bad_cli)}"
+            )
+
+    if policy == "recurrent":
+        bad_recurrent_cli = sorted(set(cli_dests) & {"ema_tau"})
+        if bad_recurrent_cli:
+            raise ValueError(
+                "Parameters not used by recurrent policy: " + ", ".join(bad_recurrent_cli)
+            )
+
+def _fixed_alpha_config(alpha_base_raw, alpha_max_raw) -> bool:
+    alpha_base = parse_floats(alpha_base_raw)
+    alpha_max = parse_floats(alpha_max_raw)
+    if (len(alpha_base) == 0) or (len(alpha_base) != len(alpha_max)):
+        return False
+    return all(math.isclose(a, b, rel_tol=0.0, abs_tol=1e-12) for a, b in zip(alpha_base, alpha_max, strict=True))
+
+
+def build_required_explicit_keys(args) -> set[str]:
+    required = {
+        "env_id",
+        "num_envs",
+        "env_workers",
+        "horizon",
+        "total_steps",
+        "seed",
+        "device",
+        "algo",
+        "policy",
+        "hidden_dim",
+        "feat_dim",
+        "act_embed_dim",
+        "mask_indices",
+        "phase_len",
+        "obs_shift_scale",
+        "reward_scale_low",
+        "reward_scale_high",
+        "gamma",
+        "lr",
+        "max_grad_norm",
+        "vf_coef",
+        "ent_coef",
+        "epochs",
+        "log_interval",
+        "wandb",
+        "report",
+        "report_dir",
+    }
+    if str(getattr(args, "env_id", "")).startswith("CarRacing"):
+        required.update({"carracing_downsample", "carracing_grayscale"})
+
+    algo_name = normalize_algo_name(str(args.algo))
+    if algo_name in ON_POLICY_ALGOS or str(args.policy) == "recurrent":
+        required.add("gae_lam")
+    if algo_name in {"ppo", "a2c", "reinforce", "v-mpo"} or str(args.policy) == "recurrent":
+        required.add("minibatch_size")
+    if algo_name == "ppo" or str(args.policy) == "recurrent":
+        required.add("clip_coef")
+        required.add("vf_clip")
+        required.add("target_kl")
+    if (algo_name in ON_POLICY_ALGOS) and (str(args.policy) != "recurrent"):
+        required.add("ema_tau")
+
+    if str(args.policy) == "amt":
+        required.update({"alpha_base", "alpha_max", "reset_strategy"})
+        if str(args.reset_strategy) != "none":
+            required.add("reset_long_fraction")
+        skip_drift = (str(args.reset_strategy) == "none") and _fixed_alpha_config(args.alpha_base, args.alpha_max)
+        if not skip_drift:
+            required.update({"lambda_pred", "pred_coef"})
+            required.update({"rho_s", "rho_l", "beta", "tau_soft", "kappa", "tau_on", "tau_off", "K", "cooldown_steps", "warmup_steps"})
+
+    if algo_name == "trpo":
+        required.update({"trpo_max_kl", "trpo_backtrack_coef", "trpo_backtrack_iters", "trpo_value_epochs"})
+    elif algo_name == "v-trace":
+        required.update({"vtrace_rho_clip", "vtrace_c_clip"})
+    elif algo_name == "v-mpo":
+        required.update({"vmpo_topk_frac", "vmpo_eta", "vmpo_kl_coef", "vmpo_kl_target"})
+    elif algo_name == "dqn":
+        required.update(
+            {
+                "dqn_replay_size",
+                "dqn_batch_size",
+                "dqn_learning_starts",
+                "dqn_updates_per_iter",
+                "dqn_target_update_interval",
+                "dqn_double",
+                "dqn_eps_start",
+                "dqn_eps_end",
+                "dqn_eps_decay_steps",
+            }
+        )
+    return required
+
+
+def validate_explicit_required_keys(args, *, resolved_cfg: dict, cli_dests: set[str]) -> None:
+    required_keys = build_required_explicit_keys(args)
+    missing = []
+    for key in sorted(required_keys):
+        if key in cli_dests:
+            continue
+        if key not in resolved_cfg:
+            missing.append(key)
+            continue
+        if resolved_cfg.get(key) is None:
+            missing.append(key)
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            "Missing required explicit parameters. "
+            f"Define these in YAML config sections or pass via CLI: {missing_text}"
+        )
+
+
 def init_wandb(args):
     if not args.wandb:
         return None
@@ -125,16 +469,31 @@ def init_wandb(args):
             x_stats_gpu_count=1,
         )
     tags = parse_strs(args.wandb_tags)
-    return wandb.init(
+    config_payload = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+    source_config = getattr(args, "_source_config", None)
+    source_config_path = getattr(args, "_source_config_path", None)
+    if isinstance(source_config, dict):
+        config_payload["source_config"] = source_config
+    if source_config_path:
+        config_payload["source_config_path"] = str(source_config_path)
+    run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         tags=tags or None,
         mode=args.wandb_mode,
         dir=args.wandb_dir,
-        config=vars(args),
+        config=config_payload,
         settings=settings,
     )
+    if run is not None and source_config_path:
+        cfg_path = Path(str(source_config_path))
+        if cfg_path.exists():
+            try:
+                run.save(str(cfg_path.resolve()), policy="now")
+            except Exception as exc:  # pragma: no cover - best effort file attachment
+                print(f"Warning: unable to upload config file to W&B ({cfg_path}): {exc}")
+    return run
 
 
 class EarlyStopper:
@@ -853,6 +1212,8 @@ def train_recurrent(
     try:
         for upd in range(updates):
             updates_completed = upd + 1
+            debug_ppo = bool(args.debug_log)
+            episodes_before = len(envs.episode_returns) if debug_ppo else 0
             batch, obs, prev_action, hidden = rollout_recurrent(
                 envs=envs,
                 ac=ac,
@@ -864,13 +1225,26 @@ def train_recurrent(
                 prev_action=prev_action,
                 hidden=hidden,
             )
+            ended_episodes = envs.episode_returns[episodes_before:] if debug_ppo else []
+            ppo_debug_cfg = None
+            if debug_ppo:
+                ppo_debug_cfg = {
+                    "seed": int(args.seed),
+                    "update_idx": int(upd + 1),
+                    "action_bins": int(act_dim),
+                    "ratio_sample_size": 4096,
+                    "frame_delta_pairs": 128,
+                }
 
             ppo_stats = ppo_update_recurrent(
                 ac=ac,
                 opt=opt,
                 batch=batch,
                 clip_coef=args.clip_coef,
+                vf_clip=bool(args.vf_clip),
+                target_kl=args.target_kl,
                 vf_coef=args.vf_coef,
+                max_grad_norm=args.max_grad_norm,
                 ent_coef=args.ent_coef,
                 epochs=args.epochs,
                 lam=args.gae_lam,
@@ -880,13 +1254,29 @@ def train_recurrent(
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 grad_scaler=grad_scaler,
+                debug_cfg=ppo_debug_cfg,
             )
 
             metrics = {
                 "loop/update": upd + 1,
                 "loop/frames": (upd + 1) * args.num_envs * args.horizon,
             }
-            metrics.update({f"loss/{k}": v for k, v in ppo_stats.items()})
+            for key, value in ppo_stats.items():
+                if str(key).startswith("debug/"):
+                    metrics[key] = value
+                else:
+                    metrics[f"loss/{key}"] = value
+            if debug_ppo:
+                metrics.update(
+                    build_ppo_rollout_debug_metrics(
+                        args=args,
+                        batch=batch,
+                        update_idx=upd + 1,
+                        updates_total=updates,
+                        total_steps_target=int(args.total_steps),
+                        ended_episodes=ended_episodes,
+                    )
+                )
             add_perf_metrics(metrics, train_start=train_start, updates_done=upd + 1, updates_total=updates)
 
             mean_ret, mean_len = recent_return_stats(envs.episode_returns, window=50)
@@ -1116,7 +1506,20 @@ def main():
         help="Use fused Adam implementation (CUDA only; auto-enabled on CUDA if unset).",
     )
     p.add_argument("--clip-coef", type=float, default=0.2)
+    p.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.01,
+        help="PPO KL early-stop threshold per update. If approx_kl exceeds this, remaining PPO epochs are skipped.",
+    )
+    p.add_argument(
+        "--vf-clip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable PPO value-function clipping using --clip-coef.",
+    )
     p.add_argument("--vf-coef", type=float, default=0.5)
+    p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
@@ -1219,6 +1622,8 @@ def main():
         help="Required run note describing intent, hypothesis, and key distinguishing details.",
     )
 
+    cli_dests = collect_cli_provided_dests(p, sys.argv[1:])
+
     # two-pass parse to apply YAML defaults then allow CLI overrides
     partial_args, _ = p.parse_known_args()
     if partial_args.config and partial_args.config_path and (partial_args.config != partial_args.config_path):
@@ -1227,18 +1632,18 @@ def main():
     if config_input is None:
         raise ValueError("A config file is required. Pass it as positional <config.yaml> or via --config <path>.")
     config_path = Path(config_input)
-    if config_path.exists():
-        cfg = yaml.safe_load(config_path.read_text()) or {}
-        if not isinstance(cfg, dict):
-            raise ValueError("Config file must map keys to values.")
-        p.set_defaults(**{k: v for k, v in cfg.items() if hasattr(partial_args, k)})
-    else:
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    cfg, root_cfg = load_config_file(config_path)
+    validate_no_unknown_config_keys(resolved_cfg=cfg, parser=p)
+    p.set_defaults(**{k: v for k, v in cfg.items() if hasattr(partial_args, k)})
     args = p.parse_args()
+    args._source_config = {"root": root_cfg, "resolved": cfg}
+    args._source_config_path = str(config_path.resolve())
     args.algo = normalize_algo_name(args.algo)
     if args.algo not in ALL_ALGOS:
         choices = ", ".join(sorted(ALL_ALGOS))
         raise ValueError(f"Unsupported --algo '{args.algo}'. Expected one of: {choices}")
+    validate_explicit_required_keys(args, resolved_cfg=cfg, cli_dests=cli_dests)
+    validate_no_strange_params(args, resolved_cfg=cfg, cli_dests=cli_dests)
     args.run_note = (args.run_note or "").strip()
     args.run_postfix = sanitize_postfix(args.run_postfix)
     if not args.run_note:
@@ -1287,6 +1692,8 @@ def main():
             raise ValueError("`--encoder cnn` is not supported with `--algo dqn` yet (replay stores flattened observations).")
     if args.policy == "recurrent" and args.algo != "ppo":
         raise ValueError("`--policy recurrent` currently supports only `--algo ppo`.")
+    if (args.algo == "ppo" or args.policy == "recurrent") and float(args.target_kl) <= 0.0:
+        raise ValueError("`--target-kl` must be > 0 for PPO training.")
     if int(args.frame_stack) < 1:
         raise ValueError("`--frame-stack` must be >= 1.")
     if int(args.frame_stack) > 1 and args.encoder != "cnn":
@@ -1497,20 +1904,23 @@ def main():
         x_mem0 = encode_mem(f_mem, obs0_t, prev_action)
         traces = trace_update(traces, x_mem0, alpha_base.expand(args.num_envs, -1))
 
-    drift = DriftMonitor(
-        num_envs=args.num_envs,
-        rho_s=args.rho_s,
-        rho_l=args.rho_l,
-        beta=args.beta,
-        tau_soft=args.tau_soft,
-        kappa=args.kappa,
-        tau_on=args.tau_on,
-        tau_off=args.tau_off,
-        K=args.K,
-        cooldown_steps=args.cooldown_steps,
-        warmup_steps=args.warmup_steps,
-        device=device,
-    )
+    skip_drift = (args.reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
+    drift = None
+    if not skip_drift:
+        drift = DriftMonitor(
+            num_envs=args.num_envs,
+            rho_s=args.rho_s,
+            rho_l=args.rho_l,
+            beta=args.beta,
+            tau_soft=args.tau_soft,
+            kappa=args.kappa,
+            tau_on=args.tau_on,
+            tau_off=args.tau_off,
+            K=args.K,
+            cooldown_steps=args.cooldown_steps,
+            warmup_steps=args.warmup_steps,
+            device=device,
+        )
 
     params = list(ac.parameters())
     if predictor is not None:
@@ -1534,18 +1944,23 @@ def main():
             "predictor": module_param_stats(predictor) if predictor is not None else None,
             "optimizer": optimizer_param_stats(opt),
             "memory": {"M": int(M), "feat_dim": int(feat_dim), "mem_dim": int(mem_dim)},
-            "drift_monitor": {
-                "rho_s": float(args.rho_s),
-                "rho_l": float(args.rho_l),
-                "beta": float(args.beta),
-                "tau_soft": float(args.tau_soft),
-                "kappa": float(args.kappa),
-                "tau_on": float(args.tau_on),
-                "tau_off": float(args.tau_off),
-                "K": int(args.K),
-                "cooldown_steps": int(args.cooldown_steps),
-                "warmup_steps": int(args.warmup_steps),
-            },
+            "drift_monitor": (
+                {
+                    "enabled": True,
+                    "rho_s": float(args.rho_s),
+                    "rho_l": float(args.rho_l),
+                    "beta": float(args.beta),
+                    "tau_soft": float(args.tau_soft),
+                    "kappa": float(args.kappa),
+                    "tau_on": float(args.tau_on),
+                    "tau_off": float(args.tau_off),
+                    "K": int(args.K),
+                    "cooldown_steps": int(args.cooldown_steps),
+                    "warmup_steps": int(args.warmup_steps),
+                }
+                if drift is not None
+                else {"enabled": False, "reason": "fixed-trace/no-reset configuration"}
+            ),
             "amp": {"enabled": bool(use_amp), "dtype": str(amp_dtype).replace("torch.", "")},
         },
     )
@@ -1662,7 +2077,10 @@ def main():
                     opt=opt,
                     batch=batch,
                     clip_coef=args.clip_coef,
+                    vf_clip=bool(args.vf_clip),
+                    target_kl=args.target_kl,
                     vf_coef=args.vf_coef,
+                    max_grad_norm=args.max_grad_norm,
                     ent_coef=args.ent_coef,
                     epochs=args.epochs,
                     minibatch_size=args.minibatch_size,
@@ -1692,7 +2110,7 @@ def main():
                 metrics = {
                     "loop/update": upd + 1,
                     "loop/frames": (upd + 1) * args.num_envs * args.horizon,
-                    "diagnostics/gate_mean": float(drift.state.gate.mean().item()),
+                    "diagnostics/gate_mean": (float(drift.state.gate.mean().item()) if drift is not None else 0.0),
                 }
                 for key, value in algo_stats.items():
                     if str(key).startswith("debug/"):
@@ -1819,6 +2237,7 @@ def main():
                             use_amp=use_amp,
                             amp_dtype=amp_dtype,
                             grad_scaler=grad_scaler,
+                            max_grad_norm=args.max_grad_norm,
                         )
                         if step_stats is None:
                             continue
@@ -1842,7 +2261,7 @@ def main():
                 metrics = {
                     "loop/update": upd + 1,
                     "loop/frames": (upd + 1) * args.num_envs * args.horizon,
-                    "diagnostics/gate_mean": float(drift.state.gate.mean().item()),
+                    "diagnostics/gate_mean": (float(drift.state.gate.mean().item()) if drift is not None else 0.0),
                     "dqn/epsilon": collect_stats["epsilon"],
                     "dqn/replay_size": float(len(replay)),
                     "dqn/q_collect": collect_stats["q_mean"],

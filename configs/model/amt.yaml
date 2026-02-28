@@ -1,0 +1,22 @@
+model:
+  algo: ppo
+  policy: amt
+  hidden_dim: 128
+  feat_dim: 64
+  act_embed_dim: 16
+  alpha_base: [0.5, 0.1, 0.01]
+  alpha_max: [1.0, 0.5, 0.2]
+  lambda_pred: 0.01
+  pred_coef: 0.5
+  reset_strategy: partial
+  reset_long_fraction: 0.5
+  rho_s: 0.1
+  rho_l: 0.01
+  beta: 0.01
+  tau_soft: 1.0
+  kappa: 0.5
+  tau_on: 2.5
+  tau_off: 1.5
+  K: 5
+  cooldown_steps: 200
+  warmup_steps: 1000
