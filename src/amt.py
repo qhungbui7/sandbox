@@ -176,7 +176,7 @@ def rollout(
     envs: EnvPool,
     ac: ActorCritic,
     f_mem: FeatureEncoder,
-    drift: DriftMonitor,
+    drift: DriftMonitor | None,
     predictor: Predictor | None,
     device: str,
     horizon: int,
@@ -260,6 +260,8 @@ def rollout(
             reset_buf[t] = reset_event
             traces_next = trace_update(traces, x_mem_next, alpha_const)
         else:
+            if drift is None:
+                raise RuntimeError("Drift monitor is required when adaptive drift is enabled.")
             _, v_next_prov = ac(
                 next_obs_t,
                 next_prev_action,
@@ -287,7 +289,8 @@ def rollout(
 
         done_mask = done
         if done_mask.any():
-            drift.reset_where(done_mask)
+            if drift is not None:
+                drift.reset_where(done_mask)
             traces_next[done_mask] = 0.0
             traces_next[done_mask] = trace_update(
                 traces_next[done_mask],
@@ -344,6 +347,8 @@ def rollout_recurrent(
     val_buf = torch.zeros((horizon, n_envs), device=device)
     rew_buf = torch.zeros((horizon, n_envs), device=device)
     done_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
+    term_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
+    trunc_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
 
     h, c = hidden
     h0, c0 = h.clone(), c.clone()
@@ -361,11 +366,13 @@ def rollout_recurrent(
         logp_buf[t] = logp
         val_buf[t] = value
 
-        next_obs, reward, done_env, trunc, _info = envs.step(action.cpu().numpy())
-        done = done_env | trunc
+        next_obs, reward, terminated, truncated, _info = envs.step(action.cpu().numpy())
+        done = terminated | truncated
 
         rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
         done_buf[t] = torch.as_tensor(done, device=device, dtype=torch.bool)
+        term_buf[t] = torch.as_tensor(terminated, device=device, dtype=torch.bool)
+        trunc_buf[t] = torch.as_tensor(truncated, device=device, dtype=torch.bool)
 
         if done.any():
             done_idx = torch.as_tensor(done, device=device)
@@ -386,6 +393,8 @@ def rollout_recurrent(
         "values_old": val_buf,
         "rewards": rew_buf,
         "dones": done_buf,
+        "terminated": term_buf,
+        "truncated": trunc_buf,
         "value_T": value_T,
         "h0": h0,
         "c0": c0,

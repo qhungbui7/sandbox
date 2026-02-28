@@ -1,20 +1,30 @@
-env_id: CarRacing-v3
-algo: ppo
-policy: ff
-device: cuda
-num_envs: 8
-env_workers: 2
-horizon: 256
-total_steps: 102400
-carracing_downsample: 2
-carracing_grayscale: true
-seed: 0
-mask_indices: []
-phase_len: 0
-obs_shift_scale: 0.0
-reward_scale_low: 1.0
-reward_scale_high: 1.0
-wandb: false
-report: true
-report_dir: reports/benchmarks
-report_run_name: carracing_stationary_fullobs
+config_paths:
+  env: ../../env/benchmarks/carracing/stationary_fullobs.yaml
+  model: ../../model/benchmarks/ff_ppo.yaml
+  training: ../../training/benchmarks/carracing_102400.yaml
+  other: ../../other/benchmark_reporting.yaml
+overrides:
+  env:
+    env_id: CarRacing-v3
+    carracing_downsample: 2
+    carracing_grayscale: true
+    mask_indices: []
+    phase_len: 0
+    obs_shift_scale: 0.0
+    reward_scale_low: 1.0
+    reward_scale_high: 1.0
+  model:
+    algo: ppo
+    policy: ff
+  training:
+    num_envs: 8
+    env_workers: 2
+    horizon: 256
+    total_steps: 102400
+  other:
+    device: cuda
+    seed: 0
+    wandb: false
+    report: true
+    report_dir: reports/benchmarks
+    report_run_name: carracing_stationary_fullobs

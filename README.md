@@ -97,6 +97,40 @@ export REPORT_DIR=reports/benchmarks
 | `--debug-log` | Enable extra per-update PPO debug diagnostics in `metrics.jsonl`/W&B. |
 | `--tf32`, `--adam-fused`, `--compile` | CUDA speed knobs (use `--no-tf32` / `--no-adam-fused` to disable). |
 
+## Modular config layout
+
+Configs are now split into reusable section files:
+
+- `configs/env/` (environment + observability/drift setup)
+- `configs/model/` (policy/algo + AMT model settings)
+- `configs/training/` (rollout/optimizer schedule)
+- `configs/other/` (runtime/logging/reporting)
+
+Run entries (for example `configs/cartpole/amt.yaml` and `configs/benchmarks/*/*.yaml`) are manifests that point to these sections:
+
+```yaml
+config_paths:
+  env: ../env/cartpole_nonstationary_partialobs.yaml
+  model: ../model/amt.yaml
+  training: ../training/full_501760.yaml
+  other: ../other/default_cuda.yaml
+overrides:
+  other:
+    wandb_run_name: amt_baseline
+```
+
+The run command is unchanged: choose the manifest path you want to run:
+
+```bash
+.venv/bin/python amg.py <path-to-config.yaml> --run-note \"...\"
+```
+
+Supported config composition keys are:
+
+- `config_paths` (or `configs`): map of section name to YAML path
+- `include` / `includes` / `inherit` / `inherits`: optional extra base configs
+- `overrides`: final values applied last
+
 ## W&B logging guide
 
 1. Make sure `wandb` is installed and `WANDB_API_KEY` is exported (or present in `.env`).  

@@ -1,17 +1,27 @@
-env_id: Acrobot-v1
-algo: ppo
-policy: amt
-device: cuda
-num_envs: 8
-horizon: 128
-total_steps: 300032
-seed: 0
-mask_indices: [1, 3]
-phase_len: 1500
-obs_shift_scale: 0.1
-reward_scale_low: 0.8
-reward_scale_high: 1.2
-wandb: false
-report: true
-report_dir: reports/benchmarks
-report_run_name: acrobot_nonstationary_partialobs
+config_paths:
+  env: ../../env/benchmarks/acrobot/nonstationary_partialobs.yaml
+  model: ../../model/benchmarks/amt_ppo.yaml
+  training: ../../training/benchmarks/acrobot_300032.yaml
+  other: ../../other/benchmark_reporting.yaml
+overrides:
+  env:
+    env_id: Acrobot-v1
+    mask_indices: [1, 3]
+    phase_len: 1500
+    obs_shift_scale: 0.1
+    reward_scale_low: 0.8
+    reward_scale_high: 1.2
+  model:
+    algo: ppo
+    policy: amt
+  training:
+    num_envs: 8
+    horizon: 128
+    total_steps: 300032
+  other:
+    device: cuda
+    seed: 0
+    wandb: false
+    report: true
+    report_dir: reports/benchmarks
+    report_run_name: acrobot_nonstationary_partialobs

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
@@ -154,20 +155,22 @@ def _build_active_args(args: dict) -> dict:
         "recurrent": ["hidden_dim", "feat_dim", "act_embed_dim"],
     }
     algo_keys = {
-        "ppo": ["clip_coef", "vf_coef", "ent_coef", "epochs", "minibatch_size"],
-        "a2c": ["vf_coef", "ent_coef", "epochs", "minibatch_size"],
+        "ppo": ["clip_coef", "vf_clip", "target_kl", "vf_coef", "max_grad_norm", "ent_coef", "epochs", "minibatch_size"],
+        "a2c": ["vf_coef", "max_grad_norm", "ent_coef", "epochs", "minibatch_size"],
         "trpo": [
             "vf_coef",
+            "max_grad_norm",
             "ent_coef",
             "trpo_max_kl",
             "trpo_backtrack_coef",
             "trpo_backtrack_iters",
             "trpo_value_epochs",
         ],
-        "reinforce": ["vf_coef", "ent_coef", "epochs", "minibatch_size"],
-        "v-trace": ["vf_coef", "ent_coef", "epochs", "vtrace_rho_clip", "vtrace_c_clip"],
+        "reinforce": ["vf_coef", "max_grad_norm", "ent_coef", "epochs", "minibatch_size"],
+        "v-trace": ["vf_coef", "max_grad_norm", "ent_coef", "epochs", "vtrace_rho_clip", "vtrace_c_clip"],
         "v-mpo": [
             "vf_coef",
+            "max_grad_norm",
             "ent_coef",
             "epochs",
             "minibatch_size",
@@ -178,6 +181,7 @@ def _build_active_args(args: dict) -> dict:
         ],
         "dqn": [
             "vf_coef",
+            "max_grad_norm",
             "ent_coef",
             "dqn_replay_size",
             "dqn_batch_size",
@@ -288,6 +292,7 @@ class RunReporter:
     run_dir: Path
     summary_path: Path
     metrics_path: Path
+    metrics_csv_path: Path
     logs_path: Path
     summary: dict
     start_time: float
@@ -357,8 +362,10 @@ class RunReporter:
         if checkpoint_path is not None:
             self.summary["checkpoint"] = str(checkpoint_path)
         self.summary["runtime_sec"] = round(time.time() - self.start_time, 3)
+        self._export_metrics_csv()
         self.summary["artifacts"] = {
             "metrics_jsonl": str(self.metrics_path),
+            "metrics_csv": str(self.metrics_csv_path),
             "logs_txt": str(self.logs_path),
         }
         self.summary["training_stats"] = {
@@ -376,6 +383,41 @@ class RunReporter:
 
     def _write_summary(self) -> None:
         self.summary_path.write_text(json.dumps(self.summary, indent=2, sort_keys=True))
+
+    def _export_metrics_csv(self) -> None:
+        fieldnames: list[str] = []
+        rows: list[dict] = []
+        seen = set()
+        with self.metrics_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
+                rows.append(row)
+                for key in row.keys():
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fieldnames.append(key)
+
+        with self.metrics_csv_path.open("w", encoding="utf-8", newline="") as f:
+            if not fieldnames:
+                f.write("")
+                return
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                serializable_row = {}
+                for key in fieldnames:
+                    value = row.get(key)
+                    if isinstance(value, (dict, list)):
+                        serializable_row[key] = json.dumps(value, sort_keys=True)
+                    else:
+                        serializable_row[key] = value
+                writer.writerow(serializable_row)
 
 
 def start_run_report(
@@ -396,6 +438,7 @@ def start_run_report(
             run_dir=Path("."),
             summary_path=Path("."),
             metrics_path=Path("."),
+            metrics_csv_path=Path("."),
             logs_path=Path("."),
             summary={},
             start_time=time.time(),
@@ -463,6 +506,7 @@ def start_run_report(
         "seed": args.get("seed"),
         "regime": _infer_regime_from_args(args),
     }
+    active_args = _sanitize(_build_active_args(args))
     summary = {
         "run_id": run_id,
         "run_dir": str(run_dir),
@@ -472,8 +516,11 @@ def start_run_report(
         "run_identity": run_identity,
         "config_path": config_path,
         "git_sha": _safe_git_sha(repo_root),
-        "args": _sanitize(args),
-        "active_args": _sanitize(_build_active_args(args)),
+        # Keep only run-relevant arguments in summary to avoid noisy defaults
+        # from inactive algorithms/policies.
+        "args": active_args,
+        # Backward-compatible alias for downstream scripts.
+        "active_args": active_args,
         "env": {
             "env_id": args.get("env_id"),
             "obs_dim": int(obs_dim),
@@ -485,13 +532,16 @@ def start_run_report(
 
     summary_path = run_dir / "run_summary.json"
     metrics_path = run_dir / "metrics.jsonl"
+    metrics_csv_path = run_dir / "metrics.csv"
     logs_path = run_dir / "train.log"
     metrics_path.write_text("", encoding="utf-8")
+    metrics_csv_path.write_text("", encoding="utf-8")
     logs_path.write_text("", encoding="utf-8")
     reporter = RunReporter(
         run_dir=run_dir,
         summary_path=summary_path,
         metrics_path=metrics_path,
+        metrics_csv_path=metrics_csv_path,
         logs_path=logs_path,
         summary=summary,
         start_time=time.time(),
