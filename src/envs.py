@@ -69,8 +69,6 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
     DEFAULT_ACTIONS = np.asarray(
         [
             [0.0, 0.0, 0.0],   # no-op / coast
-            [-1.0, 0.0, 0.0],  # steer left
-            [1.0, 0.0, 0.0],   # steer right
             [0.0, 1.0, 0.0],   # gas
             [0.0, 0.0, 0.8],   # brake
             [-1.0, 0.7, 0.0],  # left + gas

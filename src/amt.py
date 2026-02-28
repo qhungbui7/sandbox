@@ -374,12 +374,14 @@ def rollout_recurrent(
         term_buf[t] = torch.as_tensor(terminated, device=device, dtype=torch.bool)
         trunc_buf[t] = torch.as_tensor(truncated, device=device, dtype=torch.bool)
 
+        next_prev_action = action.clone()
         if done.any():
             done_idx = torch.as_tensor(done, device=device)
             h[:, done_idx] = 0.0
             c[:, done_idx] = 0.0
+            next_prev_action[done_idx] = 0
 
-        prev_action = action
+        prev_action = next_prev_action
         obs = next_obs
 
     obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)

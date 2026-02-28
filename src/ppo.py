@@ -25,8 +25,8 @@ def compute_gae(
     for t in reversed(range(T)):
         next_value = last_value if t == T - 1 else values[t + 1]
         nonterminal = (~dones[t]).float()
-        delta = rewards[t] + gamma * nonterminal * next_value - values[t]
         trunc = (~resets[t]).float()
+        delta = rewards[t] + gamma * nonterminal * trunc * next_value - values[t]
         last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
         adv[t] = last_gae
     returns = adv + values
@@ -130,7 +130,7 @@ def ppo_update(
     logp_old = batch["logp_old"]
     values_old = batch["values_old"]
     rewards = batch["rewards"]
-    dones = batch["terminated"] if "terminated" in batch else batch["dones"]
+    dones = batch["dones"]
     resets = batch["resets"]
     value_T = batch["value_T"]
     x_mem = batch["x_mem"]
@@ -263,7 +263,7 @@ def ppo_update_recurrent(
     logp_old = batch["logp_old"]
     values_old = batch["values_old"]
     rewards = batch["rewards"]
-    dones = batch["terminated"] if "terminated" in batch else batch["dones"]
+    dones = batch["dones"]
     h0 = batch["h0"]
     c0 = batch["c0"]
     value_T = batch["value_T"]
