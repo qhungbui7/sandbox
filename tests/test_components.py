@@ -2,6 +2,7 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import gymnasium as gym
 import torch
 import numpy as np
 
@@ -502,6 +503,208 @@ def test_recurrent_rollout_and_update_cpu():
         assert key in debug_stats
     assert "terminated" in batch
     assert "truncated" in batch
+
+
+def test_ppo_updates_bootstrap_with_dones_not_terminated(monkeypatch):
+    set_seed(3)
+    device = "cpu"
+    envs, obs0 = _build_envs(num_envs=2, seed=3)
+
+    obs_dim = int(np.prod(envs.single_observation_space.shape))
+    act_dim = int(envs.single_action_space.n)
+    feat_dim = 16
+    hidden_dim = 32
+    M = 2
+    mem_dim = M * feat_dim
+
+    ac = ActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        mem_dim=mem_dim,
+    ).to(device)
+    f_mem = FeatureEncoder(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+    ).to(device)
+    f_mem.load_state_dict(ac.f_pol.state_dict())
+
+    alpha_base = torch.tensor([0.5, 0.1], device=device).unsqueeze(0)
+    alpha_max = torch.tensor([0.8, 0.3], device=device).unsqueeze(0)
+    traces = torch.zeros((envs.num_envs, M, feat_dim), device=device)
+    prev_action = torch.zeros(envs.num_envs, device=device, dtype=torch.int64)
+    obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
+    traces = trace_update(traces, f_mem(obs0_t, prev_action), alpha_base.expand(envs.num_envs, -1))
+
+    class DummyDrift:
+        def update(self, e):
+            gate = torch.zeros(e.shape, device=device)
+            reset = torch.zeros(e.shape, device=device, dtype=torch.bool)
+            return gate, reset
+
+        def reset_where(self, mask):
+            return
+
+    batch_ff, _, _, _ = rollout(
+        envs=envs,
+        ac=ac,
+        f_mem=f_mem,
+        drift=DummyDrift(),
+        predictor=None,
+        device=device,
+        horizon=6,
+        gamma=0.99,
+        lambda_pred=0.0,
+        obs_normalization="none",
+        alpha_base=alpha_base,
+        alpha_max=alpha_max,
+        reset_strategy="none",
+        reset_long_fraction=0.5,
+        obs=obs0,
+        prev_action=prev_action,
+        traces=traces,
+    )
+    batch_ff["terminated"] = torch.zeros_like(batch_ff["dones"])
+    batch_ff["dones"][0, 0] = True
+    assert torch.any(batch_ff["dones"] != batch_ff["terminated"])
+
+    import src.ppo as ppo_module
+
+    def _fake_gae_ff(rewards, dones, resets, values, last_value, gamma, lam):
+        assert torch.equal(dones, batch_ff["dones"])
+        return torch.zeros_like(rewards), torch.zeros_like(values)
+
+    monkeypatch.setattr(ppo_module, "compute_gae", _fake_gae_ff)
+    _ = ppo_update(
+        ac=ac,
+        opt=torch.optim.Adam(ac.parameters(), lr=1e-3),
+        batch=batch_ff,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        minibatch_size=4,
+        lam=0.95,
+        gamma=0.99,
+        pred=None,
+        pred_coef=0.0,
+        generator=torch.Generator(device=device).manual_seed(3),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+    )
+
+    ac_rec = RecurrentActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+    ).to(device)
+    hidden = ac_rec.init_hidden(envs.num_envs, device)
+    batch_rec, _, _, _ = rollout_recurrent(
+        envs=envs,
+        ac=ac_rec,
+        device=device,
+        horizon=6,
+        gamma=0.99,
+        obs_normalization="none",
+        obs=obs0,
+        prev_action=torch.zeros(envs.num_envs, device=device, dtype=torch.int64),
+        hidden=hidden,
+    )
+    batch_rec["terminated"] = torch.zeros_like(batch_rec["dones"])
+    batch_rec["dones"][0, 0] = True
+    assert torch.any(batch_rec["dones"] != batch_rec["terminated"])
+
+    def _fake_gae_rec(rewards, dones, resets, values, last_value, gamma, lam):
+        assert torch.equal(dones, batch_rec["dones"])
+        return torch.zeros_like(rewards), torch.zeros_like(values)
+
+    monkeypatch.setattr(ppo_module, "compute_gae", _fake_gae_rec)
+    _ = ppo_update_recurrent(
+        ac=ac_rec,
+        opt=torch.optim.Adam(ac_rec.parameters(), lr=1e-3),
+        batch=batch_rec,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        lam=0.95,
+        gamma=0.99,
+        generator=torch.Generator(device=device).manual_seed(3),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+    )
+
+
+def test_rollout_recurrent_resets_prev_action_on_done():
+    device = "cpu"
+
+    class AlwaysTruncatedEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+
+        def reset(self, seed=None, options=None):
+            return np.zeros((4,), dtype=np.float32), {}
+
+        def step(self, action):
+            obs = np.zeros((4,), dtype=np.float32)
+            return obs, 0.0, False, True, {}
+
+    class DeterministicRecurrentPolicy(torch.nn.Module):
+        def __init__(self, act_dim: int):
+            super().__init__()
+            self.act_dim = act_dim
+
+        def forward(self, obs, prev_action, hidden):
+            batch = obs.shape[0]
+            logits = torch.full((batch, self.act_dim), -1000.0, device=obs.device)
+            logits[:, 1] = 1000.0
+            value = torch.zeros(batch, device=obs.device)
+            return logits, value, hidden
+
+    envs = EnvPool([AlwaysTruncatedEnv])
+    obs0, _ = envs.reset(seed=0)
+    ac = DeterministicRecurrentPolicy(act_dim=2).to(device)
+    hidden = (torch.zeros((1, 1, 1), device=device), torch.zeros((1, 1, 1), device=device))
+    prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+
+    batch, _obs, prev_action_last, _hidden = rollout_recurrent(
+        envs=envs,
+        ac=ac,
+        device=device,
+        horizon=4,
+        gamma=0.99,
+        obs_normalization="none",
+        obs=obs0,
+        prev_action=prev_action,
+        hidden=hidden,
+    )
+
+    assert torch.all(batch["dones"])
+    assert torch.equal(batch["prev_action"], torch.zeros_like(batch["prev_action"]))
+    assert torch.equal(prev_action_last, torch.zeros_like(prev_action_last))
 
 
 def test_cnn_encoder_forward_cpu():
