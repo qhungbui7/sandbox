@@ -48,8 +48,8 @@ def compute_gae(
     for t in reversed(range(T)):
         next_value = last_value if t == T - 1 else values[t + 1]
         nonterminal = (~dones[t]).float()
-        delta = rewards[t] + gamma * nonterminal * next_value - values[t]
         trunc = (~resets[t]).float()
+        delta = rewards[t] + gamma * nonterminal * trunc * next_value - values[t]
         last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
         adv[t] = last_gae
     returns = adv + values
@@ -194,7 +194,7 @@ def ppo_update(
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
 ) -> dict[str, float]:
-    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
+    bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
         bootstrap_stops,
@@ -428,7 +428,7 @@ def a2c_update(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
-    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
+    bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
         bootstrap_stops,
@@ -594,7 +594,7 @@ def trpo_update(
     backtrack_iters: int,
     value_epochs: int,
 ) -> dict[str, float]:
-    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
+    bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
         bootstrap_stops,
@@ -837,7 +837,7 @@ def vmpo_update(
     kl_coef: float,
     kl_target: float,
 ) -> dict[str, float]:
-    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
+    bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
         bootstrap_stops,
