@@ -35,7 +35,12 @@ def test_run_reporter_writes_metrics_logs_and_summary(tmp_path: Path):
     assert summary["active_args"]["env_id"] == "CartPole-v1"
 
     metrics_path = Path(summary["artifacts"]["metrics_jsonl"])
+    metrics_csv_path = Path(summary["artifacts"]["metrics_csv"])
     logs_path = Path(summary["artifacts"]["logs_txt"])
     assert metrics_path.exists()
+    assert metrics_csv_path.exists()
+    csv_text = metrics_csv_path.read_text()
+    assert "loop/frames" in csv_text
+    assert "train/ret50" in csv_text
     assert logs_path.exists()
     assert "unit test line" in logs_path.read_text()

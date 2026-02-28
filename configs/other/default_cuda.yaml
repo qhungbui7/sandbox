@@ -1,0 +1,10 @@
+other:
+  device: cuda
+  cuda_id: 0
+  seed: 0
+  amp: true
+  amp_dtype: float16
+  wandb: false
+  wandb_project: amt
+  report: true
+  report_dir: reports

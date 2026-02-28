@@ -1,0 +1,6 @@
+other:
+  device: cuda
+  seed: 0
+  wandb: false
+  report: true
+  report_dir: reports/benchmarks

@@ -127,6 +127,37 @@ def _slope_last_k(xs: np.ndarray, ys: np.ndarray, k: int) -> float:
     return float(slope)
 
 
+def _delta_last_k(values: np.ndarray, k: int) -> float:
+    tail = values[max(0, values.shape[0] - k) :]
+    tail = tail[np.isfinite(tail)]
+    if tail.size < 2:
+        return float("nan")
+    half = tail.size // 2
+    if half < 1:
+        return float("nan")
+    prev = tail[-(2 * half) : -half]
+    last = tail[-half:]
+    if (prev.size == 0) or (last.size == 0):
+        return float("nan")
+    return float(last.mean() - prev.mean())
+
+
+def _tail_quantile(values: np.ndarray, k: int, q: float) -> float:
+    tail = values[max(0, values.shape[0] - k) :]
+    tail = tail[np.isfinite(tail)]
+    if tail.size == 0:
+        return float("nan")
+    return float(np.quantile(tail, q))
+
+
+def _tail_fraction_gt(values: np.ndarray, k: int, threshold: float) -> float:
+    tail = values[max(0, values.shape[0] - k) :]
+    valid = np.isfinite(tail)
+    if int(valid.sum()) == 0:
+        return float("nan")
+    return float((tail[valid] > threshold).mean())
+
+
 def _run_row_with_derived(summary_path: Path) -> tuple[dict, dict]:
     data = json.loads(summary_path.read_text(encoding="utf-8"))
     run_dir = summary_path.parent
@@ -147,10 +178,8 @@ def _run_row_with_derived(summary_path: Path) -> tuple[dict, dict]:
         dtype=np.float64,
     )
 
-    hist = np.asarray(
-        [[float(row.get(f"debug/action/hist_{idx}", float("nan"))) for idx in range(7)] for row in metrics_rows],
-        dtype=np.float64,
-    )
+    hist_rows = [[float(row.get(f"debug/action/hist_{idx}", float("nan"))) for idx in range(7)] for row in metrics_rows]
+    hist = np.asarray(hist_rows, dtype=np.float64).reshape((-1, 7))
     hist_total = hist.sum(axis=1, keepdims=True)
     probs = hist / np.maximum(hist_total, 1e-12)
     action_dom = probs.max(axis=1)
@@ -177,6 +206,7 @@ def _run_row_with_derived(summary_path: Path) -> tuple[dict, dict]:
     else:
         time_to_collapse = float("nan")
 
+    last_k = 15
     summary_row = {
         "run_id": data.get("run_id", run_dir.name),
         "env_id": data.get("env", {}).get("env_id", args.get("env_id")),
@@ -215,6 +245,11 @@ def _run_row_with_derived(summary_path: Path) -> tuple[dict, dict]:
         "frames": frames_final,
         "runtime_sec": runtime,
         "fps_est": fps_est,
+        "ret50_smooth_slope_lastK": _slope_last_k(frames, ret50_smooth, last_k),
+        "ret50_smooth_delta_lastK": _delta_last_k(ret50_smooth, last_k),
+        "value_loss_p95_lastK": _tail_quantile(value_loss, last_k, 0.95),
+        "frac_clip_gt_0.2_lastK": _tail_fraction_gt(clipfrac, last_k, 0.2),
+        "frac_kl_gt_0.02_lastK": _tail_fraction_gt(kl_abs, last_k, 0.02),
     }
 
     derived = {
@@ -342,6 +377,11 @@ def _write_summary_csv(rows: list[dict], path: Path) -> None:
         "explained_variance_end",
         "frac_ev_lt_0",
         "score",
+        "ret50_smooth_slope_lastK",
+        "ret50_smooth_delta_lastK",
+        "value_loss_p95_lastK",
+        "frac_clip_gt_0.2_lastK",
+        "frac_kl_gt_0.02_lastK",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")

@@ -1,0 +1,6 @@
+model:
+  algo: ppo
+  policy: recurrent
+  hidden_dim: 128
+  feat_dim: 64
+  act_embed_dim: 16

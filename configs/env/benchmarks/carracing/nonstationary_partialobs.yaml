@@ -1,0 +1,9 @@
+env:
+  env_id: CarRacing-v3
+  carracing_downsample: 2
+  carracing_grayscale: true
+  mask_indices: [2]
+  phase_len: 1000
+  obs_shift_scale: 8.0
+  reward_scale_low: 0.8
+  reward_scale_high: 1.2

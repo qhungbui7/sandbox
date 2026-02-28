@@ -128,7 +128,10 @@ def test_on_policy_algorithm_updates_cpu():
             opt=opt,
             batch=batch,
             clip_coef=0.2,
+            vf_clip=True,
+            target_kl=0.01,
             vf_coef=0.5,
+            max_grad_norm=0.5,
             ent_coef=0.01,
             epochs=1,
             minibatch_size=4,
@@ -223,6 +226,7 @@ def test_dqn_collect_and_update_cpu():
         use_amp=False,
         amp_dtype=torch.float16,
         grad_scaler=None,
+        max_grad_norm=0.5,
     )
     assert stats is not None
     for key in ["q_loss", "q_mean", "target_q_mean", "td_abs"]:

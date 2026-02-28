@@ -96,6 +96,7 @@ def _step_optimizer(
     opt: torch.optim.Optimizer,
     model: nn.Module,
     grad_scaler: torch.amp.GradScaler | None,
+    max_grad_norm: float,
     grad_modules: dict[str, nn.Module] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     module_norms: dict[str, torch.Tensor] = {}
@@ -103,7 +104,7 @@ def _step_optimizer(
     if grad_scaler is not None and grad_scaler.is_enabled():
         grad_scaler.scale(loss).backward()
         grad_scaler.unscale_(opt)
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -115,7 +116,7 @@ def _step_optimizer(
         grad_scaler.update()
     else:
         loss.backward()
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -175,7 +176,10 @@ def ppo_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     clip_coef: float,
+    vf_clip: bool,
+    target_kl: float,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     minibatch_size: int,
@@ -190,9 +194,10 @@ def ppo_update(
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
 ) -> dict[str, float]:
+    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
-        batch["dones"],
+        bootstrap_stops,
         batch["resets"],
         batch["values_old"],
         batch["value_T"],
@@ -269,6 +274,8 @@ def ppo_update(
         ratio_filled = 0
         grad_modules = None
 
+    stop_due_to_kl = False
+    kl_early_stop = target_kl > 0.0
     for _ in range(epochs):
         perm = idx[torch.randperm(flat["B"], generator=generator, device=idx.device)]
         for start in range(0, flat["B"], minibatch_size):
@@ -279,11 +286,19 @@ def ppo_update(
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
 
-                ratio = (logp - flat["logp_old_f"][mb]).exp()
+                log_ratio = logp - flat["logp_old_f"][mb]
+                ratio = log_ratio.exp()
                 pg1 = ratio * flat["adv_f"][mb]
                 pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * flat["adv_f"][mb]
                 policy_loss = -torch.min(pg1, pg2).mean()
-                value_loss = 0.5 * (flat["returns_f"][mb] - values).pow(2).mean()
+                if vf_clip:
+                    value_delta = values - flat["values_old_f"][mb]
+                    values_clipped = flat["values_old_f"][mb] + torch.clamp(value_delta, -clip_coef, clip_coef)
+                    value_err = (flat["returns_f"][mb] - values).pow(2)
+                    value_err_clipped = (flat["returns_f"][mb] - values_clipped).pow(2)
+                    value_loss = 0.5 * torch.maximum(value_err, value_err_clipped).mean()
+                else:
+                    value_loss = 0.5 * (flat["returns_f"][mb] - values).pow(2).mean()
                 pred_loss = _pred_loss(
                     pred=pred,
                     pred_coef=pred_coef,
@@ -298,10 +313,12 @@ def ppo_update(
                 opt=opt,
                 model=ac,
                 grad_scaler=grad_scaler,
+                max_grad_norm=max_grad_norm,
                 grad_modules=grad_modules,
             )
             with torch.no_grad():
                 approx_kl = (flat["logp_old_f"][mb] - logp).mean()
+                kl_for_stop = (ratio - 1.0 - log_ratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
                 sum_policy = sum_policy + policy_loss.detach().float()
                 sum_value = sum_value + value_loss.detach().float()
@@ -328,6 +345,12 @@ def ppo_update(
                         ratio.detach().float(),
                         generator=debug_gen,
                     )
+
+                if kl_early_stop and float(kl_for_stop.detach().item()) > target_kl:
+                    stop_due_to_kl = True
+                    break
+        if stop_due_to_kl:
+            break
 
     count = max(mb_count, 1)
     inv_count = 1.0 / float(count)
@@ -391,6 +414,7 @@ def a2c_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     minibatch_size: int,
@@ -404,9 +428,10 @@ def a2c_update(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
+    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
-        batch["dones"],
+        bootstrap_stops,
         batch["resets"],
         batch["values_old"],
         batch["value_T"],
@@ -446,7 +471,7 @@ def a2c_update(
                 )
                 loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
-            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
             with torch.no_grad():
                 approx_kl = (flat["logp_old_f"][mb] - logp).mean()
 
@@ -470,6 +495,7 @@ def reinforce_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     minibatch_size: int,
@@ -517,7 +543,7 @@ def reinforce_update(
                 )
                 loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
-            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
             with torch.no_grad():
                 approx_kl = (flat["logp_old_f"][mb] - logp).mean()
 
@@ -553,6 +579,7 @@ def trpo_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     lam: float,
     gamma: float,
@@ -567,9 +594,10 @@ def trpo_update(
     backtrack_iters: int,
     value_epochs: int,
 ) -> dict[str, float]:
+    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
-        batch["dones"],
+        bootstrap_stops,
         batch["resets"],
         batch["values_old"],
         batch["value_T"],
@@ -647,7 +675,7 @@ def trpo_update(
                 x_mem_next=flat["x_mem_next_f"],
             )
             loss = vf_coef * value_loss + pred_coef * pred_loss
-        _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+        _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
         value_loss_acc += value_loss.detach().item()
         pred_loss_acc += pred_loss.detach().item()
 
@@ -696,6 +724,7 @@ def vtrace_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     gamma: float,
@@ -764,7 +793,7 @@ def vtrace_update(
             )
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
-        _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+        _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
         with torch.no_grad():
             approx_kl = (logp_old.reshape(-1) - logp_f).mean()
             clipfrac = ((logp - logp_old).exp() > rho_clip).float().mean()
@@ -790,6 +819,7 @@ def vmpo_update(
     opt: torch.optim.Optimizer,
     batch: dict,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     minibatch_size: int,
@@ -807,9 +837,10 @@ def vmpo_update(
     kl_coef: float,
     kl_target: float,
 ) -> dict[str, float]:
+    bootstrap_stops = batch["terminated"] if "terminated" in batch else batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
-        batch["dones"],
+        bootstrap_stops,
         batch["resets"],
         batch["values_old"],
         batch["value_T"],
@@ -863,7 +894,7 @@ def vmpo_update(
                     + kl_coef * kl_penalty
                 )
 
-            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+            _step_optimizer(loss=loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
 
             stats["policy_loss"] += policy_loss.detach().item()
             stats["value_loss"] += value_loss.detach().item()
@@ -886,7 +917,10 @@ def update_on_policy(
     opt: torch.optim.Optimizer,
     batch: dict,
     clip_coef: float,
+    vf_clip: bool,
+    target_kl: float,
     vf_coef: float,
+    max_grad_norm: float,
     ent_coef: float,
     epochs: int,
     minibatch_size: int,
@@ -918,7 +952,10 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             clip_coef=clip_coef,
+            vf_clip=vf_clip,
+            target_kl=target_kl,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             epochs=epochs,
             minibatch_size=minibatch_size,
@@ -939,6 +976,7 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             epochs=epochs,
             minibatch_size=minibatch_size,
@@ -958,6 +996,7 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             epochs=epochs,
             minibatch_size=minibatch_size,
@@ -976,6 +1015,7 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             lam=lam,
             gamma=gamma,
@@ -996,6 +1036,7 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             epochs=epochs,
             gamma=gamma,
@@ -1014,6 +1055,7 @@ def update_on_policy(
             opt=opt,
             batch=batch,
             vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
             ent_coef=ent_coef,
             epochs=epochs,
             minibatch_size=minibatch_size,
@@ -1149,7 +1191,7 @@ def dqn_collect_rollout(
     envs: EnvPool,
     ac: ActorCritic,
     f_mem: FeatureEncoder,
-    drift: DriftMonitor,
+    drift: DriftMonitor | None,
     predictor: Predictor | None,
     replay: DQNReplayBuffer,
     device: str,
@@ -1205,6 +1247,8 @@ def dqn_collect_rollout(
         if skip_drift:
             traces_next = trace_update(traces, x_mem_next, alpha_const)
         else:
+            if drift is None:
+                raise RuntimeError("Drift monitor is required when adaptive drift is enabled.")
             _, v_next_prov = ac(
                 next_obs_t,
                 next_prev_action,
@@ -1225,7 +1269,8 @@ def dqn_collect_rollout(
             traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
             traces_next = trace_update(traces_reset, x_mem_next, alpha)
         if done.any():
-            drift.reset_where(done)
+            if drift is not None:
+                drift.reset_where(done)
             traces_next[done] = 0.0
             traces_next[done] = trace_update(
                 traces_next[done],
@@ -1270,6 +1315,7 @@ def dqn_update(
     use_amp: bool,
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
+    max_grad_norm: float,
 ) -> dict[str, float] | None:
     if len(replay) < batch_size:
         return None
@@ -1290,7 +1336,7 @@ def dqn_update(
             q_boot = batch["rewards"] + gamma * (~batch["dones"]).float() * q_next
         q_loss = F.smooth_l1_loss(q_selected, q_boot)
 
-    _step_optimizer(loss=q_loss, opt=opt, model=ac, grad_scaler=grad_scaler)
+    _step_optimizer(loss=q_loss, opt=opt, model=ac, grad_scaler=grad_scaler, max_grad_norm=max_grad_norm)
     with torch.no_grad():
         td_abs = (q_selected - q_boot).abs().mean().item()
     return {
