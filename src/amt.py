@@ -387,7 +387,8 @@ def rollout_recurrent(
         obs = next_obs
 
     obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
-    logits_T, value_T, (h, c) = ac(obs_T, prev_action, (h, c))
+    # Bootstrap value at obs_T without advancing the carried recurrent state.
+    _, value_T, _ = ac(obs_T, prev_action, (h, c))
 
     batch = {
         "obs": obs_buf,

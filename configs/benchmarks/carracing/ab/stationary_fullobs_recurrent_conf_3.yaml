@@ -21,11 +21,11 @@ overrides:
     env_workers: 2
     horizon: 256
     total_steps: 102400
-    epochs: 4
-    ent_coef: 1e-2
-    vf_coef: 0.5
+    epochs: 8
+    ent_coef: 1e-3
+    vf_coef: 0.25
     max_grad_norm: 0.5
-    lr: 0.0001
+    lr: 0.0003
     target_kl : 0.01
   other:
     device: cuda
@@ -33,4 +33,4 @@ overrides:
     wandb: false
     report: true
     report_dir: reports/benchmarks
-    report_run_name: carracing_stationary_fullobs_recurrent_vf025_gn1_lr3e5
+    report_run_name: carracing_stationary_fullobs_recurrent_vf025_gn1_lr3e-3
