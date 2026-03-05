@@ -342,6 +342,20 @@ def validate_no_strange_params(args, *, resolved_cfg: dict, cli_dests: set[str])
                 "Parameters not used by recurrent policy: " + ", ".join(bad_recurrent_cli)
             )
 
+    # Keep A2C/REINFORCE on-policy in this trainer by enforcing one full-batch update per rollout.
+    if algo in {"a2c", "reinforce"}:
+        frames_per_update = int(args.num_envs) * int(args.horizon)
+        if int(args.epochs) != 1:
+            raise ValueError(
+                f"`algo={algo}` requires `epochs=1` for on-policy updates "
+                "(no repeated passes over the same rollout)."
+            )
+        if int(args.minibatch_size) < frames_per_update:
+            raise ValueError(
+                f"`algo={algo}` requires `minibatch_size >= num_envs*horizon` "
+                f"(got {args.minibatch_size}, need at least {frames_per_update}) so each rollout is used in one batch."
+            )
+
 def _fixed_alpha_config(alpha_base_raw, alpha_max_raw) -> bool:
     alpha_base = parse_floats(alpha_base_raw)
     alpha_max = parse_floats(alpha_max_raw)
@@ -935,7 +949,9 @@ def evaluate_trace_policy(
 
             x_mem_t = encode_mem(f_mem, obs_t, prev_action)
             next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=args.obs_normalization)
-            next_prev_action = action
+            next_prev_action = action.clone()
+            if done.any():
+                next_prev_action[done] = 0
             x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
 
             if skip_drift:
@@ -1075,11 +1091,13 @@ def evaluate_recurrent_policy(
             next_obs, reward, terminated, truncated, _ = eval_envs.step(action.cpu().numpy())
             done_env = terminated | truncated
             done = torch.as_tensor(done_env, device=device, dtype=torch.bool)
+            next_prev_action = action.clone()
             if done.any():
                 h[:, done] = 0.0
                 c[:, done] = 0.0
+                next_prev_action[done] = 0
 
-            prev_action = action
+            prev_action = next_prev_action
             obs = next_obs
             step_calls += 1
 
@@ -1724,6 +1742,11 @@ def main():
     env_workers = int(args.env_workers)
     if env_workers < 0:
         raise ValueError("--env-workers must be >= 0.")
+    if env_workers > 1 and str(args.env_id).startswith("CarRacing"):
+        print(
+            "Note: CarRacing with --env-workers > 1 uses threaded stepping; "
+            "if you observe nondeterminism or rare crashes, try --env-workers 0/1."
+        )
     frames_per_update = int(args.num_envs) * int(args.horizon)
     if frames_per_update <= 0:
         raise ValueError("--num-envs and --horizon must both be > 0.")

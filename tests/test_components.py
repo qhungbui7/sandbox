@@ -313,6 +313,34 @@ def test_validate_no_strange_params_rejects_algo_specific_cli_knob():
         raise AssertionError("Expected strict validator to reject DQN-only CLI key for PPO.")
 
 
+def test_validate_no_strange_params_rejects_a2c_multiple_epochs():
+    args = _strict_args_template(algo="a2c", epochs=2, minibatch_size=1024, reset_strategy="partial")
+    resolved_cfg = vars(args).copy()
+    try:
+        validate_no_strange_params(args, resolved_cfg=resolved_cfg, cli_dests=set())
+    except ValueError as exc:
+        assert "epochs=1" in str(exc)
+    else:
+        raise AssertionError("Expected strict validator to enforce epochs=1 for A2C.")
+
+
+def test_validate_no_strange_params_rejects_reinforce_minibatching():
+    args = _strict_args_template(algo="reinforce", epochs=1, minibatch_size=256, reset_strategy="partial")
+    resolved_cfg = vars(args).copy()
+    try:
+        validate_no_strange_params(args, resolved_cfg=resolved_cfg, cli_dests=set())
+    except ValueError as exc:
+        assert "minibatch_size" in str(exc)
+    else:
+        raise AssertionError("Expected strict validator to enforce full-batch REINFORCE updates.")
+
+
+def test_validate_no_strange_params_accepts_a2c_single_full_batch():
+    args = _strict_args_template(algo="a2c", epochs=1, minibatch_size=1024, reset_strategy="partial")
+    resolved_cfg = vars(args).copy()
+    validate_no_strange_params(args, resolved_cfg=resolved_cfg, cli_dests=set())
+
+
 def test_amt_rollout_and_update_cpu():
     set_seed(0)
     device = "cpu"
@@ -503,6 +531,69 @@ def test_recurrent_rollout_and_update_cpu():
         assert key in debug_stats
     assert "terminated" in batch
     assert "truncated" in batch
+
+
+def test_ppo_update_recurrent_resets_hidden_on_done_boundaries():
+    device = "cpu"
+    T, N = 2, 1
+
+    class HiddenRecorderPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(0.25))
+            self.hidden_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def forward(self, obs, prev_action, hidden):
+            h, c = hidden
+            self.hidden_inputs.append((h.detach().clone(), c.detach().clone()))
+            batch = obs.shape[0]
+            logits = torch.stack([self.scale.expand(batch), (-self.scale).expand(batch)], dim=-1)
+            value = self.scale.expand(batch)
+            next_h = torch.full_like(h, 3.0)
+            next_c = torch.full_like(c, 5.0)
+            return logits, value, (next_h, next_c)
+
+    ac = HiddenRecorderPolicy().to(device)
+    batch = {
+        "obs": torch.zeros((T, N, 4), device=device),
+        "prev_action": torch.zeros((T, N), device=device, dtype=torch.int64),
+        "actions": torch.zeros((T, N), device=device, dtype=torch.int64),
+        "logp_old": torch.zeros((T, N), device=device),
+        "values_old": torch.zeros((T, N), device=device),
+        "rewards": torch.tensor([[1.0], [0.0]], device=device),
+        "dones": torch.tensor([[True], [False]], device=device),
+        "h0": torch.ones((1, N, 2), device=device),
+        "c0": 2.0 * torch.ones((1, N, 2), device=device),
+        "value_T": torch.zeros((N,), device=device),
+    }
+
+    _ = ppo_update_recurrent(
+        ac=ac,
+        opt=torch.optim.Adam(ac.parameters(), lr=1e-3),
+        batch=batch,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        lam=0.95,
+        gamma=0.99,
+        generator=torch.Generator(device=device).manual_seed(7),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+    )
+
+    assert len(ac.hidden_inputs) == T
+    h_t0, c_t0 = ac.hidden_inputs[0]
+    h_t1, c_t1 = ac.hidden_inputs[1]
+    assert torch.equal(h_t0, batch["h0"])
+    assert torch.equal(c_t0, batch["c0"])
+    assert torch.equal(h_t1, torch.zeros_like(h_t1))
+    assert torch.equal(c_t1, torch.zeros_like(c_t1))
 
 
 def test_ppo_updates_bootstrap_with_dones_not_terminated(monkeypatch):
@@ -705,6 +796,76 @@ def test_rollout_recurrent_resets_prev_action_on_done():
     assert torch.all(batch["dones"])
     assert torch.equal(batch["prev_action"], torch.zeros_like(batch["prev_action"]))
     assert torch.equal(prev_action_last, torch.zeros_like(prev_action_last))
+
+
+def test_rollout_resets_prev_action_and_next_mem_on_done():
+    device = "cpu"
+    feat_dim = 3
+    M = 2
+
+    class AlwaysTruncatedEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+
+        def reset(self, seed=None, options=None):
+            return np.zeros((4,), dtype=np.float32), {}
+
+        def step(self, action):
+            obs = np.zeros((4,), dtype=np.float32)
+            return obs, 0.0, False, True, {}
+
+    class DeterministicPolicy(torch.nn.Module):
+        def forward(self, obs, prev_action, traces):
+            batch = obs.shape[0]
+            logits = torch.full((batch, 2), -1000.0, device=obs.device)
+            logits[:, 1] = 1000.0
+            value = torch.zeros(batch, device=obs.device)
+            return logits, value
+
+    class PrevActionFeature(torch.nn.Module):
+        def forward(self, obs, prev_action):
+            return prev_action.float().unsqueeze(-1).expand(-1, feat_dim)
+
+    envs = EnvPool([AlwaysTruncatedEnv])
+    obs0, _ = envs.reset(seed=0)
+    ac = DeterministicPolicy().to(device)
+    f_mem = PrevActionFeature().to(device)
+    prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+    alpha_base = torch.tensor([[0.5, 0.1]], device=device)
+    traces = torch.zeros((1, M, feat_dim), device=device)
+    obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
+    traces = trace_update(traces, f_mem(obs0_t, prev_action), alpha_base.expand(1, -1))
+
+    batch, _obs, prev_action_last, _traces = rollout(
+        envs=envs,
+        ac=ac,
+        f_mem=f_mem,
+        drift=None,
+        predictor=None,
+        device=device,
+        horizon=4,
+        gamma=0.99,
+        lambda_pred=0.0,
+        obs_normalization="none",
+        alpha_base=alpha_base,
+        alpha_max=alpha_base.clone(),
+        reset_strategy="none",
+        reset_long_fraction=0.5,
+        obs=obs0,
+        prev_action=prev_action,
+        traces=traces,
+    )
+
+    assert torch.all(batch["dones"])
+    assert torch.equal(batch["prev_action"], torch.zeros_like(batch["prev_action"]))
+    assert torch.equal(prev_action_last, torch.zeros_like(prev_action_last))
+    assert torch.equal(batch["x_mem_next"], torch.zeros_like(batch["x_mem_next"]))
 
 
 def test_cnn_encoder_forward_cpu():
