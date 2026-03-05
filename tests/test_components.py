@@ -798,6 +798,37 @@ def test_rollout_recurrent_resets_prev_action_on_done():
     assert torch.equal(prev_action_last, torch.zeros_like(prev_action_last))
 
 
+def test_envpool_step_preserves_final_obs_before_autoreset():
+    class DoneEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=10.0,
+                shape=(1,),
+                dtype=np.float32,
+            )
+            self.reset_count = 0
+
+        def reset(self, seed=None, options=None):
+            self.reset_count += 1
+            obs = np.array([float(self.reset_count)], dtype=np.float32)
+            return obs, {"reset_count": self.reset_count}
+
+        def step(self, action):
+            obs = np.array([7.0], dtype=np.float32)
+            return obs, 0.0, False, True, {"source": "step"}
+
+    envs = EnvPool([DoneEnv])
+    _obs0, _ = envs.reset(seed=0)
+    obs1, _rew, _term, trunc, info = envs.step(np.array([0], dtype=np.int64))
+
+    assert bool(trunc[0])
+    assert float(obs1[0][0]) == 2.0
+    assert float(info[0]["final_obs"][0]) == 7.0
+    assert info[0]["reset_info"]["reset_count"] == 2
+
+
 def test_rollout_recurrent_bootstrap_does_not_advance_hidden_state():
     device = "cpu"
 
@@ -856,6 +887,64 @@ def test_rollout_recurrent_bootstrap_does_not_advance_hidden_state():
     expected = torch.full_like(h_last, float(horizon))
     assert torch.equal(h_last, expected)
     assert torch.equal(c_last, expected)
+
+
+def test_rollout_recurrent_timeout_bootstraps_from_final_obs():
+    device = "cpu"
+    gamma = 0.5
+
+    class AlwaysTruncatedEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-5.0,
+                high=5.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+        def reset(self, seed=None, options=None):
+            return np.zeros((2,), dtype=np.float32), {}
+
+        def step(self, action):
+            final_obs = np.ones((2,), dtype=np.float32)
+            return final_obs, 1.0, False, True, {}
+
+    class ValueFromObsPolicy(torch.nn.Module):
+        def __init__(self, act_dim: int):
+            super().__init__()
+            self.act_dim = act_dim
+
+        def forward(self, obs, prev_action, hidden):
+            batch = obs.shape[0]
+            logits = torch.zeros((batch, self.act_dim), device=obs.device)
+            value = obs.sum(dim=-1)
+            return logits, value, hidden
+
+    envs = EnvPool([AlwaysTruncatedEnv])
+    obs0, _ = envs.reset(seed=0)
+    ac = ValueFromObsPolicy(act_dim=2).to(device)
+    hidden = (
+        torch.zeros((1, 1, 1), device=device),
+        torch.zeros((1, 1, 1), device=device),
+    )
+    prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+
+    batch, _obs, _prev_action, _hidden = rollout_recurrent(
+        envs=envs,
+        ac=ac,
+        device=device,
+        horizon=1,
+        gamma=gamma,
+        obs_normalization="none",
+        obs=obs0,
+        prev_action=prev_action,
+        hidden=hidden,
+    )
+
+    assert bool(batch["truncated"][0, 0].item())
+    # raw reward=1.0 plus gamma * V(final_obs=[1,1]) = 0.5 * 2.0
+    assert torch.allclose(batch["rewards"][0, 0], torch.tensor(2.0, device=device))
 
 
 def test_rollout_resets_prev_action_and_next_mem_on_done():

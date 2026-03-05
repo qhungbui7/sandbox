@@ -368,13 +368,33 @@ def rollout_recurrent(
         logp_buf[t] = logp
         val_buf[t] = value
 
-        next_obs, reward, terminated, truncated, _info = envs.step(action.cpu().numpy())
+        next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
         done = terminated | truncated
 
         rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
         done_buf[t] = torch.as_tensor(done, device=device, dtype=torch.bool)
         term_buf[t] = torch.as_tensor(terminated, device=device, dtype=torch.bool)
         trunc_buf[t] = torch.as_tensor(truncated, device=device, dtype=torch.bool)
+
+        # Time-limit handling: bootstrap from the final pre-reset observation.
+        if np.any(truncated):
+            boot_obs = np.asarray(next_obs).copy()
+            for env_idx, tr in enumerate(truncated.tolist()):
+                if not tr:
+                    continue
+                info_i = info[env_idx] if env_idx < len(info) else None
+                if isinstance(info_i, dict) and ("final_obs" in info_i):
+                    boot_obs[env_idx] = np.asarray(info_i["final_obs"])
+
+            trunc_idx_np = np.flatnonzero(truncated)
+            trunc_idx = torch.as_tensor(trunc_idx_np, device=device, dtype=torch.long)
+            boot_obs_t = obs_to_tensor(
+                boot_obs[trunc_idx_np],
+                device=device,
+                obs_normalization=obs_normalization,
+            )
+            _, v_timeout, _ = ac(boot_obs_t, action[trunc_idx], (h[:, trunc_idx], c[:, trunc_idx]))
+            rew_buf[t, trunc_idx] = rew_buf[t, trunc_idx] + (gamma * v_timeout)
 
         next_prev_action = action.clone()
         if done.any():

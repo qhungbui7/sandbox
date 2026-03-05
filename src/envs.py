@@ -223,6 +223,7 @@ class EnvPool:
 
     def step(self, actions: np.ndarray):
         obs, rew, term, trunc, infos = [], [], [], [], []
+        final_obs: dict[int, np.ndarray] = {}
 
         actions_i = [int(actions[i]) for i in range(self.num_envs)]
         if self._executor is None:
@@ -240,10 +241,13 @@ class EnvPool:
                 self._ep_returns[i] = 0.0
                 self._ep_lengths[i] = 0
                 done_indices.append(i)
+                final_obs[i] = np.asarray(o).copy()
             obs.append(o)
             rew.append(r)
             term.append(t)
             trunc.append(tr)
+            if not isinstance(info, dict):
+                info = {"env_info": info}
             infos.append(info)
 
         if done_indices:
@@ -251,12 +255,14 @@ class EnvPool:
                 for i in done_indices:
                     o_reset, info_reset = self.envs[i].reset()
                     obs[i] = o_reset
+                    infos[i]["final_obs"] = final_obs[i]
                     infos[i]["reset_info"] = info_reset
             else:
                 reset_futures = {i: self._executor.submit(self.envs[i].reset) for i in done_indices}
                 for i, fut in reset_futures.items():
                     o_reset, info_reset = fut.result()
                     obs[i] = o_reset
+                    infos[i]["final_obs"] = final_obs[i]
                     infos[i]["reset_info"] = info_reset
         return (
             np.stack(obs, axis=0),
