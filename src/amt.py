@@ -250,7 +250,9 @@ def rollout(
         xmem_buf[t] = x_mem_t
 
         next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
-        next_prev_action = action
+        next_prev_action = action.clone()
+        if done.any():
+            next_prev_action[done] = 0
 
         x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
         xmem_next_buf[t] = x_mem_next
