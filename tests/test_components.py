@@ -798,6 +798,66 @@ def test_rollout_recurrent_resets_prev_action_on_done():
     assert torch.equal(prev_action_last, torch.zeros_like(prev_action_last))
 
 
+def test_rollout_recurrent_bootstrap_does_not_advance_hidden_state():
+    device = "cpu"
+
+    class NeverDoneEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+
+        def reset(self, seed=None, options=None):
+            return np.zeros((4,), dtype=np.float32), {}
+
+        def step(self, action):
+            obs = np.zeros((4,), dtype=np.float32)
+            return obs, 0.0, False, False, {}
+
+    class HiddenIncrementPolicy(torch.nn.Module):
+        def __init__(self, act_dim: int):
+            super().__init__()
+            self.act_dim = act_dim
+
+        def forward(self, obs, prev_action, hidden):
+            h, c = hidden
+            batch = obs.shape[0]
+            logits = torch.zeros((batch, self.act_dim), device=obs.device)
+            value = torch.zeros(batch, device=obs.device)
+            return logits, value, (h + 1.0, c + 1.0)
+
+    envs = EnvPool([NeverDoneEnv])
+    obs0, _ = envs.reset(seed=0)
+    ac = HiddenIncrementPolicy(act_dim=2).to(device)
+    hidden0 = (
+        torch.zeros((1, 1, 1), device=device),
+        torch.zeros((1, 1, 1), device=device),
+    )
+    prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+    horizon = 4
+
+    _batch, _obs, _prev_action_last, hidden_last = rollout_recurrent(
+        envs=envs,
+        ac=ac,
+        device=device,
+        horizon=horizon,
+        gamma=0.99,
+        obs_normalization="none",
+        obs=obs0,
+        prev_action=prev_action,
+        hidden=hidden0,
+    )
+
+    h_last, c_last = hidden_last
+    expected = torch.full_like(h_last, float(horizon))
+    assert torch.equal(h_last, expected)
+    assert torch.equal(c_last, expected)
+
+
 def test_rollout_resets_prev_action_and_next_mem_on_done():
     device = "cpu"
     feat_dim = 3
