@@ -1241,7 +1241,9 @@ def dqn_collect_rollout(
 
         x_mem_t = encode_mem(f_mem, obs_t, prev_action)
         next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
-        next_prev_action = action
+        next_prev_action = action.clone()
+        if done.any():
+            next_prev_action[done] = 0
         x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
 
         if skip_drift:

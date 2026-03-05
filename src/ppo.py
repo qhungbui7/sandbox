@@ -365,6 +365,9 @@ def ppo_update_recurrent(
                     traj_entropy.append(dist.entropy().mean())
                     if debug_enabled:
                         traj_max_action_prob.append(logits.float().softmax(dim=-1).max(dim=-1).values.mean())
+                done_t = dones[t, env_id].to(dtype=h.dtype)
+                h = h * (1.0 - done_t)
+                c = c * (1.0 - done_t)
 
             values_all = torch.cat(traj_values, dim=0).squeeze(-1)
             logp_all = torch.stack(traj_logp, dim=0)

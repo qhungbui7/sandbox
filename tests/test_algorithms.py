@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
 import torch
 
@@ -233,6 +234,92 @@ def test_dqn_collect_and_update_cpu():
     for key in ["q_loss", "q_mean", "target_q_mean", "td_abs"]:
         assert key in stats
         assert torch.isfinite(torch.tensor(stats[key]))
+
+
+def test_dqn_collect_rollout_resets_next_prev_action_on_done():
+    device = "cpu"
+    feat_dim = 3
+    M = 2
+    obs_dim = 4
+
+    class AlwaysTruncatedEnv:
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(obs_dim,),
+                dtype=np.float32,
+            )
+
+        def reset(self, seed=None, options=None):
+            return np.zeros((obs_dim,), dtype=np.float32), {}
+
+        def step(self, action):
+            obs = np.zeros((obs_dim,), dtype=np.float32)
+            return obs, 0.0, False, True, {}
+
+    class DeterministicQ(torch.nn.Module):
+        def forward(self, obs, prev_action, traces):
+            batch = obs.shape[0]
+            q_values = torch.full((batch, 2), -1000.0, device=obs.device)
+            q_values[:, 1] = 1000.0
+            value = torch.zeros(batch, device=obs.device)
+            return q_values, value
+
+    class PrevActionFeature(torch.nn.Module):
+        def forward(self, obs, prev_action):
+            return prev_action.float().unsqueeze(-1).expand(-1, feat_dim)
+
+    envs = EnvPool([AlwaysTruncatedEnv])
+    obs0, _ = envs.reset(seed=0)
+
+    ac = DeterministicQ().to(device)
+    f_mem = PrevActionFeature().to(device)
+    alpha_base = torch.tensor([[0.5, 0.1]], device=device)
+    traces = torch.zeros((1, M, feat_dim), device=device)
+    prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+    obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
+    traces = trace_update(traces, f_mem(obs0_t, prev_action), alpha_base.expand(1, -1))
+
+    replay = DQNReplayBuffer(capacity=32, obs_dim=obs_dim, trace_dim=M * feat_dim)
+    obs_out, prev_action_out, traces_out, collect_stats = dqn_collect_rollout(
+        envs=envs,
+        ac=ac,
+        f_mem=f_mem,
+        drift=None,
+        predictor=None,
+        replay=replay,
+        device=device,
+        horizon=4,
+        gamma=0.99,
+        lambda_pred=0.0,
+        obs_normalization="none",
+        alpha_base=alpha_base,
+        alpha_max=alpha_base.clone(),
+        reset_strategy="none",
+        reset_long_fraction=0.5,
+        obs=obs0,
+        prev_action=prev_action,
+        traces=traces,
+        epsilon=0.0,
+        action_generator=torch.Generator(device=device).manual_seed(0),
+    )
+
+    assert obs_out is not None
+    assert traces_out is not None
+    assert collect_stats["q_mean"] == collect_stats["q_mean"]
+    assert len(replay) == 4
+    assert torch.all(replay.dones[: len(replay)])
+    assert torch.equal(prev_action_out, torch.zeros_like(prev_action_out))
+    assert torch.equal(
+        replay.next_prev_action[: len(replay)],
+        torch.zeros_like(replay.next_prev_action[: len(replay)]),
+    )
+    assert torch.equal(
+        replay.next_traces[: len(replay)],
+        torch.zeros_like(replay.next_traces[: len(replay)]),
+    )
 
 
 def test_on_policy_gae_uses_dones_not_terminated(monkeypatch):

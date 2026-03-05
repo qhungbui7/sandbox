@@ -71,8 +71,8 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
             [0.0, 0.0, 0.0],   # no-op / coast
             [0.0, 1.0, 0.0],   # gas
             [0.0, 0.0, 0.8],   # brake
-            [-1.0, 0.7, 0.0],  # left + gas
-            [1.0, 0.7, 0.0],   # right + gas
+            [-0.6, 0.5, 0.0],  # left + gas
+            [0.6, 0.5, 0.0],   # right + gas
         ],
         dtype=np.float32,
     )

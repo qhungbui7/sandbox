@@ -62,6 +62,9 @@ def test_discrete_carracing_wrapper_maps_actions():
     wrapped = DiscreteCarRacingWrapper(env)
     assert isinstance(wrapped.action_space, gym.spaces.Discrete)
     assert wrapped.action_space.n == wrapped.action_table.shape[0]
+    assert wrapped.action_space.n == 5
+    assert np.allclose(wrapped.action_table[3], np.asarray([-0.6, 0.5, 0.0], dtype=np.float32))
+    assert np.allclose(wrapped.action_table[4], np.asarray([0.6, 0.5, 0.0], dtype=np.float32))
 
     wrapped.reset(seed=0)
     _, _, _, _, _ = wrapped.step(0)
