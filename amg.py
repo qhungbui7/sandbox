@@ -817,6 +817,116 @@ def maybe_compile_module(module: torch.nn.Module, enabled: bool, mode: str) -> t
         return module
 
 
+class TorchProfilerController:
+    def __init__(self, *, args, reporter, device: str, phase_label: str):
+        self.enabled = bool(getattr(args, "torch_profiler", False))
+        self._reporter = reporter
+        self._profiler = None
+        self._summary_path: Path | None = None
+        self._sort_by = str(getattr(args, "torch_profiler_sort_by", "") or "").strip()
+        self._row_limit = int(getattr(args, "torch_profiler_row_limit", 40))
+        if not self.enabled:
+            return
+
+        default_sort = "self_cuda_time_total" if torch.device(device).type == "cuda" else "self_cpu_time_total"
+        if not self._sort_by:
+            self._sort_by = default_sort
+
+        raw_dir = str(getattr(args, "torch_profiler_dir", "") or "").strip()
+        if raw_dir:
+            output_dir = Path(raw_dir)
+        elif reporter.enabled:
+            output_dir = reporter.run_dir / "profiler" / phase_label
+        else:
+            output_dir = Path("reports") / "profiler" / phase_label
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._summary_path = output_dir / "key_averages.txt"
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.device(device).type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        schedule = torch.profiler.schedule(
+            wait=int(getattr(args, "torch_profiler_wait", 1)),
+            warmup=int(getattr(args, "torch_profiler_warmup", 1)),
+            active=int(getattr(args, "torch_profiler_active", 3)),
+            repeat=int(getattr(args, "torch_profiler_repeat", 1)),
+            skip_first=int(getattr(args, "torch_profiler_skip_first", 0)),
+        )
+        trace_handler = torch.profiler.tensorboard_trace_handler(str(output_dir), worker_name=phase_label)
+        profiler_cfg = {
+            "enabled": True,
+            "phase": phase_label,
+            "output_dir": str(output_dir),
+            "activities": [str(a).replace("ProfilerActivity.", "") for a in activities],
+            "wait": int(getattr(args, "torch_profiler_wait", 1)),
+            "warmup": int(getattr(args, "torch_profiler_warmup", 1)),
+            "active": int(getattr(args, "torch_profiler_active", 3)),
+            "repeat": int(getattr(args, "torch_profiler_repeat", 1)),
+            "skip_first": int(getattr(args, "torch_profiler_skip_first", 0)),
+            "record_shapes": bool(getattr(args, "torch_profiler_record_shapes", True)),
+            "profile_memory": bool(getattr(args, "torch_profiler_profile_memory", True)),
+            "with_stack": bool(getattr(args, "torch_profiler_with_stack", False)),
+            "with_flops": bool(getattr(args, "torch_profiler_with_flops", False)),
+            "sort_by": self._sort_by,
+            "row_limit": self._row_limit,
+        }
+        if reporter.enabled:
+            reporter.log_block("torch_profiler", profiler_cfg)
+            reporter.update_summary({"torch_profiler": profiler_cfg})
+        print(
+            f"[torch-profiler] enabled phase={phase_label} output_dir={output_dir} "
+            f"schedule=(wait={profiler_cfg['wait']}, warmup={profiler_cfg['warmup']}, "
+            f"active={profiler_cfg['active']}, repeat={profiler_cfg['repeat']})"
+        )
+        try:
+            self._profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=trace_handler,
+                record_shapes=bool(getattr(args, "torch_profiler_record_shapes", True)),
+                profile_memory=bool(getattr(args, "torch_profiler_profile_memory", True)),
+                with_stack=bool(getattr(args, "torch_profiler_with_stack", False)),
+                with_flops=bool(getattr(args, "torch_profiler_with_flops", False)),
+            )
+            self._profiler.__enter__()
+        except Exception as exc:
+            self.enabled = False
+            self._profiler = None
+            print(f"Warning: failed to start torch profiler ({exc}); continuing without profiling.")
+
+    def step(self) -> None:
+        if self._profiler is None:
+            return
+        try:
+            self._profiler.step()
+        except Exception as exc:
+            print(f"Warning: torch profiler step failed ({exc}); disabling profiler for remaining updates.")
+            self.close()
+
+    def close(self) -> None:
+        if self._profiler is None:
+            return
+        try:
+            self._profiler.__exit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            table = self._profiler.key_averages().table(sort_by=self._sort_by, row_limit=self._row_limit)
+        except Exception:
+            try:
+                table = self._profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=self._row_limit)
+            except Exception as exc:
+                table = f"Unable to render profiler key averages: {exc}"
+        if self._summary_path is not None:
+            self._summary_path.write_text(table + "\n", encoding="utf-8")
+            print(f"[torch-profiler] wrote key averages to {self._summary_path}")
+            if self._reporter.enabled:
+                self._reporter.log_line(f"torch profiler key averages: {self._summary_path}")
+                self._reporter.update_summary({"torch_profiler_key_averages": str(self._summary_path)})
+        self._profiler = None
+
+
 def _snapshot_rng_state() -> dict:
     state: dict = {
         "torch_cpu": torch.get_rng_state(),
@@ -1223,6 +1333,7 @@ def train_recurrent(
     progress = None
     if (tqdm is not None) and (not getattr(args, "no_tqdm", False)):
         progress = tqdm(total=updates, dynamic_ncols=True, desc=f"{args.env_id} | recurrent+ppo", leave=True)
+    profiler = TorchProfilerController(args=args, reporter=reporter, device=device, phase_label="recurrent")
 
     final_metrics = None
     final_checkpoint = None
@@ -1357,6 +1468,7 @@ def train_recurrent(
                     }
                 )
                 progress.update(1)
+            profiler.step()
             if should_stop:
                 break
         final_checkpoint = reporter.save_checkpoint(
@@ -1369,6 +1481,7 @@ def train_recurrent(
             }
         )
     finally:
+        profiler.close()
         if wandb_run is not None:
             wandb_run.finish()
         if progress is not None:
@@ -1511,6 +1624,54 @@ def main():
         choices=["default", "reduce-overhead", "max-autotune"],
         help="torch.compile mode.",
     )
+    p.add_argument(
+        "--torch-profiler",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.profiler to capture per-update CPU/CUDA bottlenecks.",
+    )
+    p.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        default=None,
+        help="Output directory for profiler traces/key averages. Default: <run_dir>/profiler/<phase> when --report.",
+    )
+    p.add_argument("--torch-profiler-wait", type=int, default=1, help="Profiler schedule wait steps.")
+    p.add_argument("--torch-profiler-warmup", type=int, default=1, help="Profiler schedule warmup steps.")
+    p.add_argument("--torch-profiler-active", type=int, default=3, help="Profiler schedule active steps.")
+    p.add_argument("--torch-profiler-repeat", type=int, default=1, help="Profiler schedule repeat count.")
+    p.add_argument("--torch-profiler-skip-first", type=int, default=0, help="Skip this many initial profiler steps.")
+    p.add_argument(
+        "--torch-profiler-record-shapes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record operator input shapes in profiler.",
+    )
+    p.add_argument(
+        "--torch-profiler-profile-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Track memory usage in profiler.",
+    )
+    p.add_argument(
+        "--torch-profiler-with-stack",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture Python stack traces in profiler (higher overhead).",
+    )
+    p.add_argument(
+        "--torch-profiler-with-flops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Estimate FLOPs for supported operators.",
+    )
+    p.add_argument(
+        "--torch-profiler-sort-by",
+        type=str,
+        default="",
+        help="Sort key for key_averages table (default: self_cuda_time_total on CUDA, self_cpu_time_total on CPU).",
+    )
+    p.add_argument("--torch-profiler-row-limit", type=int, default=40, help="Row count in key_averages table.")
     p.add_argument(
         "--adam-foreach",
         action=argparse.BooleanOptionalAction,
@@ -1738,6 +1899,21 @@ def main():
         args.eval_seed = eval_seed
     if args.eval_num_envs is None:
         args.eval_num_envs = eval_num_envs
+
+    if int(args.torch_profiler_wait) < 0:
+        raise ValueError("--torch-profiler-wait must be >= 0.")
+    if int(args.torch_profiler_warmup) < 0:
+        raise ValueError("--torch-profiler-warmup must be >= 0.")
+    if int(args.torch_profiler_active) < 1:
+        raise ValueError("--torch-profiler-active must be >= 1.")
+    if int(args.torch_profiler_repeat) < 1:
+        raise ValueError("--torch-profiler-repeat must be >= 1.")
+    if int(args.torch_profiler_skip_first) < 0:
+        raise ValueError("--torch-profiler-skip-first must be >= 0.")
+    if int(args.torch_profiler_row_limit) < 1:
+        raise ValueError("--torch-profiler-row-limit must be >= 1.")
+    if args.torch_profiler and (eval_interval > 0):
+        print("Note: torch profiler is enabled with evaluation; eval steps are included in profiled updates.")
 
     env_workers = int(args.env_workers)
     if env_workers < 0:
@@ -2053,6 +2229,12 @@ def main():
             desc=f"{args.env_id} | {args.policy}+{args.algo}",
             leave=True,
         )
+    profiler = TorchProfilerController(
+        args=args,
+        reporter=reporter,
+        device=device,
+        phase_label=f"{str(args.policy)}_{str(args.algo)}",
+    )
 
     final_metrics = None
     final_checkpoint = None
@@ -2356,6 +2538,7 @@ def main():
                     }
                 )
                 progress.update(1)
+            profiler.step()
             if should_stop:
                 break
         final_checkpoint = reporter.save_checkpoint(
@@ -2372,6 +2555,7 @@ def main():
             }
         )
     finally:
+        profiler.close()
         if wandb_run is not None:
             wandb_run.finish()
         if progress is not None:
