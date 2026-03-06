@@ -73,7 +73,14 @@ def load_report_metrics(report_dir: Path, run_name: str) -> dict:
     if not summary_path.exists():
         return {}
     data = json.loads(summary_path.read_text())
-    return data.get("final_metrics", {}) or {}
+    final_metrics = data.get("final_metrics", {}) or {}
+    training_stats = data.get("training_stats", {}) if isinstance(data.get("training_stats"), dict) else {}
+    if training_stats:
+        final_metrics = dict(final_metrics)
+        final_metrics["train/best_ret50"] = training_stats.get("best_ret50")
+        final_metrics["train/second_best_ret50"] = training_stats.get("second_best_ret50")
+        final_metrics["train/last_ret50"] = training_stats.get("last_ret50")
+    return final_metrics
 
 
 def is_number(value) -> bool:
@@ -407,6 +414,9 @@ def main() -> None:
                         "regime": regime,
                         "algo": algo,
                         "seed": seed,
+                        "best_ret50": metrics.get("train/best_ret50"),
+                        "second_best_ret50": metrics.get("train/second_best_ret50"),
+                        "last_ret50": metrics.get("train/last_ret50"),
                         "ret50": metrics.get("train/ret50"),
                         "len50": metrics.get("train/len50"),
                         "frames": metrics.get("loop/frames"),
@@ -428,10 +438,11 @@ def main() -> None:
 
     if not args.dry_run and results:
         print("\n=== Per-Run Results ===")
-        print("run_name,env,regime,algo,seed,ret50,len50,frames")
+        print("run_name,env,regime,algo,seed,best_ret50,second_best_ret50,last_ret50,ret50,len50,frames")
         for row in results:
             print(
                 f"{row['run_name']},{row['env']},{row['regime']},{row['algo']},{row['seed']},"
+                f"{row['best_ret50']},{row['second_best_ret50']},{row['last_ret50']},"
                 f"{row['ret50']},{row['len50']},{row['frames']}",
             )
 
