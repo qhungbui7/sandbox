@@ -1,0 +1,55 @@
+Note: CarRacing with --env-workers > 1 uses threaded stepping; if you observe nondeterminism or rare crashes, try --env-workers 0/1.
+Traceback (most recent call last):
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/amg.py", line 2383, in <module>
+    main()
+    ~~~~^^
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/amg.py", line 1795, in main
+    reporter = start_run_report(
+        repo_root=Path(__file__).resolve().parent,
+    ...<8 lines>...
+        enabled=args.report,
+    )
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/src/reporting.py", line 475, in start_run_report
+    "cuda_available": torch.cuda.is_available(),
+                      ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py", line 184, in is_available
+    return torch._C._cuda_getDeviceCount() > 0
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+KeyboardInterrupt
+>>> /raid/nobackup/trustvision/hungbui/workspace/per/amt/.venv/bin/python amg.py configs/benchmarks/carracing/ab/stationary_fullobs_recurrent_conf_3.yaml --algo ppo --seed 0 --run-note carracing recurrent vf-clip ab | env=ab regime=stationary_fullobs_recurrent_conf_3 algo=ppo seed=0 cfg=configs/benchmarks/carracing/ab/stationary_fullobs_recurrent_conf_3.yaml --report --report-dir reports/benchmarks --report-run-name ab_stationary_fullobs_recurrent_conf_3_ppo_s0_vfclip-ab-fixed-stablized-simple-joystick-test-steer-throttle-fixed --device cuda --cuda-id 7 --frame-stack 1 --wandb --wandb-project amt --wandb-entity bqhung127 --wandb-run-name ab_stationary_fullobs_recurrent_conf_3_ppo_s0_vfclip-ab-fixed-stablized-simple-joystick-test-steer-throttle-fixed --wandb-mode online --wandb-dir wandb --debug-log --eval-stochastic --encoder cnn --obs-normalization auto
+Traceback (most recent call last):
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 1280, in wait
+    return self._wait(timeout=timeout)
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 2066, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ~~~~~~~~~~~~~~^^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 2024, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/scripts/run_benchmark_matrix.py", line 469, in <module>
+    main()
+    ~~~~^^
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/scripts/run_benchmark_matrix.py", line 377, in main
+    code = run_command(cmd, dry_run=args.dry_run)
+  File "/raid/nobackup/trustvision/hungbui/workspace/per/amt/scripts/run_benchmark_matrix.py", line 68, in run_command
+    return subprocess.run(cmd, check=False).returncode
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 1214, in communicate
+    self.wait()
+    ~~~~~~~~~^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 1293, in wait
+    self._wait(timeout=sigint_timeout)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hungbui/.local/share/uv/python/cpython-3.13.6-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 2060, in _wait
+    time.sleep(delay)
+    ~~~~~~~~~~^^^^^^^
+KeyboardInterrupt
