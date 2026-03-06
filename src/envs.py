@@ -68,16 +68,18 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
 
     DEFAULT_ACTIONS = np.asarray(
         [
-            [0.0, 0.0, 0.0],   # no-op / coast
+            [0.0, 0.0, 0.0],   # coast
             [0.0, 1.0, 0.0],   # gas
             [0.0, 0.0, 0.8],   # brake
-            [-0.6, 0.5, 0.0],  # left + gas
-            [0.6, 0.5, 0.0],   # right + gas
+            [-0.6, 0.0, 0.0],  # left (no gas)
+            [0.6, 0.0, 0.0],   # right (no gas)
+            [-0.6, 0.4, 0.0],  # left + soft gas
+            [0.6, 0.4, 0.0],   # right + soft gas
         ],
         dtype=np.float32,
     )
 
-    def __init__(self, env: gym.Env, actions: np.ndarray | None = None):
+    def __init__(self, env: gym.Env, actions: np.ndarray | None = None, *, smooth_beta: float = 0.0):
         super().__init__(env)
         if not isinstance(env.action_space, gym.spaces.Box):
             raise TypeError("DiscreteCarRacingWrapper expects a Box action space.")
@@ -92,6 +94,15 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
         high = env.action_space.high.astype(np.float32)
         self._actions = np.clip(table, low, high).astype(np.float32)
         self.action_space = gym.spaces.Discrete(int(self._actions.shape[0]))
+        self.smooth_beta = float(smooth_beta)
+        if not (0.0 <= self.smooth_beta <= 1.0):
+            raise ValueError(f"`smooth_beta` must be in [0, 1], got {self.smooth_beta}")
+        self._prev = np.zeros(3, dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self._prev[:] = 0.0
+        return obs, info
 
     @property
     def action_table(self) -> np.ndarray:
@@ -101,7 +112,12 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
         idx = int(act)
         if idx < 0 or idx >= self.action_space.n:
             raise ValueError(f"Discrete action index out of range: {idx}")
-        return self._actions[idx].copy()
+        a = self._actions[idx].copy()
+        beta = self.smooth_beta
+        if beta > 0.0:
+            a = ((1.0 - beta) * self._prev + beta * a).astype(np.float32, copy=False)
+        self._prev[:] = a
+        return a
 
 
 class CarRacingPreprocessWrapper(gym.ObservationWrapper):

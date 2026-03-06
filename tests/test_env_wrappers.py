@@ -62,9 +62,11 @@ def test_discrete_carracing_wrapper_maps_actions():
     wrapped = DiscreteCarRacingWrapper(env)
     assert isinstance(wrapped.action_space, gym.spaces.Discrete)
     assert wrapped.action_space.n == wrapped.action_table.shape[0]
-    assert wrapped.action_space.n == 5
-    assert np.allclose(wrapped.action_table[3], np.asarray([-0.6, 0.5, 0.0], dtype=np.float32))
-    assert np.allclose(wrapped.action_table[4], np.asarray([0.6, 0.5, 0.0], dtype=np.float32))
+    assert wrapped.action_space.n == 7
+    assert np.allclose(wrapped.action_table[3], np.asarray([-0.6, 0.0, 0.0], dtype=np.float32))
+    assert np.allclose(wrapped.action_table[4], np.asarray([0.6, 0.0, 0.0], dtype=np.float32))
+    assert np.allclose(wrapped.action_table[5], np.asarray([-0.6, 0.4, 0.0], dtype=np.float32))
+    assert np.allclose(wrapped.action_table[6], np.asarray([0.6, 0.4, 0.0], dtype=np.float32))
 
     wrapped.reset(seed=0)
     _, _, _, _, _ = wrapped.step(0)
@@ -72,6 +74,39 @@ def test_discrete_carracing_wrapper_maps_actions():
 
     _, _, _, _, _ = wrapped.step(wrapped.action_space.n - 1)
     assert np.allclose(env.last_action, wrapped.action_table[-1])
+
+
+def test_discrete_carracing_wrapper_smooths_actions_and_resets():
+    env = DummyCarEnv()
+    wrapped = DiscreteCarRacingWrapper(env, smooth_beta=0.5)
+
+    wrapped.reset(seed=0)
+    _, _, _, _, _ = wrapped.step(1)  # gas
+    assert np.allclose(env.last_action, np.asarray([0.0, 0.5, 0.0], dtype=np.float32))
+
+    _, _, _, _, _ = wrapped.step(1)  # gas again
+    assert np.allclose(env.last_action, np.asarray([0.0, 0.75, 0.0], dtype=np.float32))
+
+    _, _, _, _, _ = wrapped.step(0)  # coast
+    assert np.allclose(env.last_action, np.asarray([0.0, 0.375, 0.0], dtype=np.float32))
+
+    wrapped.reset(seed=1)
+    _, _, _, _, _ = wrapped.step(1)  # gas after reset
+    assert np.allclose(env.last_action, np.asarray([0.0, 0.5, 0.0], dtype=np.float32))
+
+
+def test_discrete_carracing_wrapper_invalid_smooth_beta():
+    env = DummyCarEnv()
+    try:
+        _ = DiscreteCarRacingWrapper(env, smooth_beta=-0.1)
+        raise AssertionError("Expected ValueError for smooth_beta < 0")
+    except ValueError:
+        pass
+    try:
+        _ = DiscreteCarRacingWrapper(env, smooth_beta=1.1)
+        raise AssertionError("Expected ValueError for smooth_beta > 1")
+    except ValueError:
+        pass
 
 
 def test_frame_stack_wrapper_stacks_last_axis():
