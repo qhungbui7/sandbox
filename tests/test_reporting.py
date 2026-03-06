@@ -29,6 +29,8 @@ def test_run_reporter_writes_metrics_logs_and_summary(tmp_path: Path):
     summary = json.loads(summary_path.read_text())
     assert summary["training_stats"]["metric_rows"] == 1
     assert summary["training_stats"]["best_ret50"] == 10.0
+    assert summary["training_stats"]["second_best_ret50"] is None
+    assert summary["training_stats"]["last_ret50"] == 10.0
     assert summary["checkpoint"] == str(ckpt)
     assert summary["active_args"]["policy"] == "ff"
     assert summary["active_args"]["algo"] == "ppo"
@@ -44,3 +46,30 @@ def test_run_reporter_writes_metrics_logs_and_summary(tmp_path: Path):
     assert "train/ret50" in csv_text
     assert logs_path.exists()
     assert "unit test line" in logs_path.read_text()
+
+
+def test_run_reporter_tracks_best_second_and_last_ret50(tmp_path: Path):
+    reporter = start_run_report(
+        repo_root=Path(__file__).resolve().parents[1],
+        report_dir=tmp_path / "reports",
+        run_name="unit_report_ranked",
+        args={"env_id": "CartPole-v1", "policy": "ff", "algo": "ppo"},
+        device="cpu",
+        obs_dim=4,
+        act_dim=2,
+        mask_indices=[],
+        config_path=None,
+        enabled=True,
+    )
+    reporter.log_metrics({"loop/frames": 16, "train/ret50": 10.0})
+    reporter.log_metrics({"loop/frames": 32, "train/ret50": 7.0})
+    reporter.log_metrics({"loop/frames": 48, "train/ret50": 12.0})
+    reporter.log_metrics({"loop/frames": 64, "train/ret50": 9.0})
+    reporter.finalize()
+
+    summary_path = tmp_path / "reports" / "unit_report_ranked" / "run_summary.json"
+    summary = json.loads(summary_path.read_text())
+    stats = summary["training_stats"]
+    assert stats["best_ret50"] == 12.0
+    assert stats["second_best_ret50"] == 10.0
+    assert stats["last_ret50"] == 9.0

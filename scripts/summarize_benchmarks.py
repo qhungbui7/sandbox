@@ -85,6 +85,14 @@ def _nanmax(values: np.ndarray) -> float:
     return float(finite.max())
 
 
+def _nansecondmax(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size < 2:
+        return float("nan")
+    sorted_desc = np.sort(finite)[::-1]
+    return float(sorted_desc[1])
+
+
 def _nanquantile(values: np.ndarray, q: float) -> float:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -215,6 +223,9 @@ def _run_row_with_derived(summary_path: Path) -> tuple[dict, dict]:
         "policy": data.get("model", {}).get("policy", args.get("policy", "amt")),
         "seed": args.get("seed"),
         "frames_total": _last_finite(frames),
+        "best_model_ret50": _nanmax(ret50),
+        "second_model_ret50": _nansecondmax(ret50),
+        "last_model_ret50": _last_finite(ret50),
         "best_ret50": _nanmax(ret50),
         "final_ret50_mean_last10": _tail_mean(ret50, 10),
         "auc_ret50": _auc(frames, ret50),
@@ -357,6 +368,9 @@ def _write_summary_csv(rows: list[dict], path: Path) -> None:
         "policy",
         "seed",
         "frames_total",
+        "best_model_ret50",
+        "second_model_ret50",
+        "last_model_ret50",
         "best_ret50",
         "final_ret50_mean_last10",
         "auc_ret50",

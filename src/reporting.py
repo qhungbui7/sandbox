@@ -301,7 +301,9 @@ class RunReporter:
     last_log_line: str | None = None
     metric_rows: int = 0
     best_ret50: float | None = None
+    second_best_ret50: float | None = None
     best_ret50_frames: float | None = None
+    last_ret50: float | None = None
 
     def log_metrics(self, metrics: dict) -> None:
         if not self.enabled:
@@ -315,10 +317,15 @@ class RunReporter:
         self.metric_rows += 1
         ret50 = row.get("train/ret50")
         if isinstance(ret50, (int, float)) and math.isfinite(ret50):
+            ret50 = float(ret50)
+            self.last_ret50 = ret50
             if (self.best_ret50 is None) or (ret50 > self.best_ret50):
+                self.second_best_ret50 = self.best_ret50
                 self.best_ret50 = float(ret50)
                 frames = row.get("loop/frames")
                 self.best_ret50_frames = float(frames) if isinstance(frames, (int, float)) else None
+            elif (self.second_best_ret50 is None) or (ret50 > self.second_best_ret50):
+                self.second_best_ret50 = ret50
 
     def log_line(self, line: str) -> None:
         if not self.enabled:
@@ -371,7 +378,9 @@ class RunReporter:
         self.summary["training_stats"] = {
             "metric_rows": int(self.metric_rows),
             "best_ret50": self.best_ret50,
+            "second_best_ret50": self.second_best_ret50,
             "best_ret50_frames": self.best_ret50_frames,
+            "last_ret50": self.last_ret50,
         }
         self._write_summary()
 
