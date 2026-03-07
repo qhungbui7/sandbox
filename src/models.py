@@ -139,7 +139,8 @@ class ActorCritic(nn.Module):
             self.pi = nn.Linear(hidden_dim, act_dim)
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
-            self.pi_log_std = nn.Parameter(torch.zeros(act_dim))
+            init = torch.tensor([-1.0, -2.0, -2.0])
+            self.pi_log_std = nn.Parameter(init.clone())
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)
@@ -220,7 +221,8 @@ class RecurrentActorCritic(nn.Module):
             self.pi = nn.Linear(hidden_dim, act_dim)
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
-            self.pi_log_std = nn.Parameter(torch.zeros(act_dim))
+            init = torch.tensor([-1.0, -2.0, -2.0])
+            self.pi_log_std = nn.Parameter(init.clone())
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)

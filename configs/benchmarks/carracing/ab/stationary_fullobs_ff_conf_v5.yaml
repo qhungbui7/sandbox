@@ -7,7 +7,7 @@ overrides:
   env:
     env_id: CarRacing-v3
     carracing_downsample: 1 # 2
-    carracing_grayscale: false # false # true
+    carracing_grayscale: true # false # true
     mask_indices: []
     phase_len: 0
     obs_shift_scale: 0.0
