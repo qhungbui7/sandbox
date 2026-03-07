@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import yaml
 from torch.distributions.categorical import Categorical
+from torch.optim.lr_scheduler import LambdaLR
 
 import gymnasium as gym
 import wandb
@@ -341,6 +342,17 @@ def validate_no_strange_params(args, *, resolved_cfg: dict, cli_dests: set[str])
             raise ValueError(
                 "Parameters not used by recurrent policy: " + ", ".join(bad_recurrent_cli)
             )
+
+    lr_schedule = str(getattr(args, "lr_schedule", "")).strip().lower()
+    lr_end = getattr(args, "lr_end", None)
+    if lr_schedule == "none":
+        if (lr_end is not None) and ("lr_end" in explicit_keys):
+            raise ValueError("`lr_end` must be null/omitted when `lr_schedule=none`.")
+    elif lr_schedule == "linear":
+        if lr_end is not None and float(lr_end) < 0.0:
+            raise ValueError("`lr_end` must be >= 0 when `lr_schedule=linear`.")
+        if lr_end is not None and float(lr_end) > float(args.lr):
+            raise ValueError("`lr_end` must be <= `lr` when `lr_schedule=linear`.")
 
     # Keep A2C/REINFORCE on-policy in this trainer by enforcing one full-batch update per rollout.
     if algo in {"a2c", "reinforce"}:
@@ -692,6 +704,15 @@ def add_perf_metrics(metrics: dict, train_start: float, updates_done: int, updat
     metrics["perf/eta_sec"] = eta_sec
 
 
+def finite_metric(value) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    value_f = float(value)
+    if not math.isfinite(value_f):
+        return None
+    return value_f
+
+
 def numpy_array_stats(array: np.ndarray) -> dict:
     data = np.asarray(array)
     stats = {"shape": list(data.shape), "dtype": str(data.dtype)}
@@ -805,6 +826,39 @@ def make_adam_optimizer(
     except Exception as exc:  # pragma: no cover - runtime fallback
         print(f"Warning: failed to create Adam optimizer with {kwargs} ({exc}); falling back to default Adam.")
         return torch.optim.Adam(params, lr=lr)
+
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_updates: int,
+    schedule: str,
+    start_lr: float,
+    end_lr: float | None,
+):
+    schedule_name = str(schedule).strip().lower()
+    if schedule_name in {"", "none"}:
+        return None
+    if schedule_name != "linear":
+        raise ValueError(f"Unsupported --lr-schedule `{schedule}`. Expected one of: none, linear.")
+    start = float(start_lr)
+    end = 0.0 if end_lr is None else float(end_lr)
+    if start < 0.0:
+        raise ValueError("`lr` must be >= 0.")
+    if end < 0.0:
+        raise ValueError("`lr_end` must be >= 0.")
+    if end > start:
+        raise ValueError("`lr_end` must be <= `lr` for linear decay.")
+    if start == 0.0:
+        return LambdaLR(optimizer, lr_lambda=lambda _step_idx: 1.0)
+    denom = max(int(total_updates), 1)
+    end_ratio = end / start
+    return LambdaLR(
+        optimizer,
+        lr_lambda=lambda step_idx: (
+            1.0 + (end_ratio - 1.0) * min(1.0, float(step_idx + 1) / float(denom))
+        ),
+    )
 
 
 def maybe_compile_module(module: torch.nn.Module, enabled: bool, mode: str) -> torch.nn.Module:
@@ -1286,6 +1340,14 @@ def train_recurrent(
         adam_foreach=args.adam_foreach,
         adam_fused=args.adam_fused,
     )
+    updates = args.total_steps // (args.num_envs * args.horizon)
+    lr_scheduler = make_lr_scheduler(
+        opt,
+        total_updates=updates,
+        schedule=args.lr_schedule,
+        start_lr=args.lr,
+        end_lr=args.lr_end,
+    )
 
     reporter.log_block(
         "model",
@@ -1295,13 +1357,18 @@ def train_recurrent(
             "encoder": args.encoder,
             "module": module_param_stats(ac),
             "optimizer": optimizer_param_stats(opt),
+            "lr_scheduler": {
+                "type": str(args.lr_schedule),
+                "start_lr": float(args.lr),
+                "end_lr": (float(args.lr_end) if args.lr_end is not None else (0.0 if str(args.lr_schedule) == "linear" else None)),
+                "total_updates": int(updates),
+            },
             "amp": {"enabled": bool(use_amp), "dtype": str(amp_dtype).replace("torch.", "")},
         },
     )
     reporter.log_block("recurrent_actor_critic", str(ac))
     reporter.update_summary({"model_architecture": {"recurrent_actor_critic": str(ac)}})
 
-    updates = args.total_steps // (args.num_envs * args.horizon)
     early_stopper = EarlyStopper(
         metric=args.early_stop_metric,
         mode=args.early_stop_mode,
@@ -1338,6 +1405,18 @@ def train_recurrent(
     final_metrics = None
     final_checkpoint = None
     updates_completed = 0
+    best_ret50 = None
+
+    def _recurrent_checkpoint_payload(metrics: dict | None) -> dict:
+        return {
+            "policy_state": ac.state_dict(),
+            "optimizer_state": opt.state_dict(),
+            "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            "args": vars(args),
+            "frames": updates_completed * args.num_envs * args.horizon,
+            "metrics": metrics,
+        }
+
     try:
         for upd in range(updates):
             updates_completed = upd + 1
@@ -1389,6 +1468,7 @@ def train_recurrent(
             metrics = {
                 "loop/update": upd + 1,
                 "loop/frames": (upd + 1) * args.num_envs * args.horizon,
+                "optim/lr": float(opt.param_groups[0]["lr"]),
             }
             for key, value in ppo_stats.items():
                 if str(key).startswith("debug/"):
@@ -1442,6 +1522,10 @@ def train_recurrent(
                 print(stop_reason)
 
             reporter.log_metrics(metrics)
+            ret50_value = finite_metric(metrics.get("train/ret50"))
+            if (ret50_value is not None) and ((best_ret50 is None) or (ret50_value > best_ret50)):
+                best_ret50 = ret50_value
+                reporter.save_checkpoint(_recurrent_checkpoint_payload(metrics), filename="checkpoint_best.pt")
             if mean_ret is not None:
                 log_line = (
                     f"update={upd+1:04d}  episodes={len(envs.episode_returns):06d}  "
@@ -1459,6 +1543,8 @@ def train_recurrent(
             if wandb_run is not None:
                 wandb_run.log(metrics, step=metrics["loop/frames"])
             final_metrics = metrics
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             if progress is not None:
                 progress.set_postfix(
                     {
@@ -1471,15 +1557,9 @@ def train_recurrent(
             profiler.step()
             if should_stop:
                 break
-        final_checkpoint = reporter.save_checkpoint(
-            {
-                "policy_state": ac.state_dict(),
-                "optimizer_state": opt.state_dict(),
-                "args": vars(args),
-                "frames": updates_completed * args.num_envs * args.horizon,
-                "metrics": final_metrics,
-            }
-        )
+        final_payload = _recurrent_checkpoint_payload(final_metrics)
+        final_checkpoint = reporter.save_checkpoint(final_payload, filename="checkpoint.pt")
+        reporter.save_checkpoint(final_payload, filename="checkpoint_last.pt")
     finally:
         profiler.close()
         if wandb_run is not None:
@@ -1578,8 +1658,11 @@ def main():
         "--obs-normalization",
         type=str,
         default="auto",
-        choices=["auto", "none", "uint8"],
-        help="Observation scaling before model input: auto (scale uint8 by 1/255), none, or uint8.",
+        choices=["auto", "none", "uint8", "imagenet"],
+        help=(
+            "Observation normalization before model input: auto (scale uint8 by 1/255), "
+            "none, uint8 (always /255), or imagenet (ImageNet mean/std, channel-last)."
+        ),
     )
 
     p.add_argument("--alpha-base", type=str, default="0.5,0.1,0.01")
@@ -1606,6 +1689,19 @@ def main():
     p.add_argument("--gae-lam", type=float, default=0.95)
 
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="linear",
+        choices=["none", "linear"],
+        help="Learning-rate schedule applied once per update (linear uses torch.optim.lr_scheduler.LambdaLR).",
+    )
+    p.add_argument(
+        "--lr-end",
+        type=float,
+        default=None,
+        help="Final learning rate for linear decay. Must be null/omitted when --lr-schedule=none.",
+    )
     p.add_argument(
         "--tf32",
         action=argparse.BooleanOptionalAction,
@@ -2131,6 +2227,14 @@ def main():
         adam_foreach=args.adam_foreach,
         adam_fused=args.adam_fused,
     )
+    updates = args.total_steps // (args.num_envs * args.horizon)
+    lr_scheduler = make_lr_scheduler(
+        opt,
+        total_updates=updates,
+        schedule=args.lr_schedule,
+        start_lr=args.lr,
+        end_lr=args.lr_end,
+    )
 
     reporter.log_block(
         "model",
@@ -2142,6 +2246,12 @@ def main():
             "feature_encoder_ema": module_param_stats(f_mem),
             "predictor": module_param_stats(predictor) if predictor is not None else None,
             "optimizer": optimizer_param_stats(opt),
+            "lr_scheduler": {
+                "type": str(args.lr_schedule),
+                "start_lr": float(args.lr),
+                "end_lr": (float(args.lr_end) if args.lr_end is not None else (0.0 if str(args.lr_schedule) == "linear" else None)),
+                "total_updates": int(updates),
+            },
             "memory": {"M": int(M), "feat_dim": int(feat_dim), "mem_dim": int(mem_dim)},
             "drift_monitor": (
                 {
@@ -2177,7 +2287,6 @@ def main():
         }
     )
 
-    updates = args.total_steps // (args.num_envs * args.horizon)
     early_stopper = EarlyStopper(
         metric=args.early_stop_metric,
         mode=args.early_stop_mode,
@@ -2239,6 +2348,22 @@ def main():
     final_metrics = None
     final_checkpoint = None
     updates_completed = 0
+    best_ret50 = None
+
+    def _trace_checkpoint_payload(metrics: dict | None) -> dict:
+        return {
+            "policy_state": ac.state_dict(),
+            "optimizer_state": opt.state_dict(),
+            "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            "predictor_state": predictor.state_dict() if predictor is not None else None,
+            "f_mem_state": f_mem.state_dict(),
+            "target_policy_state": dqn_target_ac.state_dict() if dqn_target_ac is not None else None,
+            "replay_size": int(len(replay)) if replay is not None else None,
+            "args": vars(args),
+            "frames": updates_completed * args.num_envs * args.horizon,
+            "metrics": metrics,
+        }
+
     try:
         for upd in range(updates):
             updates_completed = upd + 1
@@ -2316,6 +2441,7 @@ def main():
                     "loop/update": upd + 1,
                     "loop/frames": (upd + 1) * args.num_envs * args.horizon,
                     "diagnostics/gate_mean": (float(drift.state.gate.mean().item()) if drift is not None else 0.0),
+                    "optim/lr": float(opt.param_groups[0]["lr"]),
                 }
                 for key, value in algo_stats.items():
                     if str(key).startswith("debug/"):
@@ -2467,6 +2593,7 @@ def main():
                     "loop/update": upd + 1,
                     "loop/frames": (upd + 1) * args.num_envs * args.horizon,
                     "diagnostics/gate_mean": (float(drift.state.gate.mean().item()) if drift is not None else 0.0),
+                    "optim/lr": float(opt.param_groups[0]["lr"]),
                     "dqn/epsilon": collect_stats["epsilon"],
                     "dqn/replay_size": float(len(replay)),
                     "dqn/q_collect": collect_stats["q_mean"],
@@ -2529,6 +2656,13 @@ def main():
                 if wandb_run is not None:
                     wandb_run.log(metrics, step=metrics["loop/frames"])
                 final_metrics = metrics
+
+            ret50_value = finite_metric(metrics.get("train/ret50"))
+            if (ret50_value is not None) and ((best_ret50 is None) or (ret50_value > best_ret50)):
+                best_ret50 = ret50_value
+                reporter.save_checkpoint(_trace_checkpoint_payload(metrics), filename="checkpoint_best.pt")
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             if progress is not None:
                 progress.set_postfix(
                     {
@@ -2541,19 +2675,9 @@ def main():
             profiler.step()
             if should_stop:
                 break
-        final_checkpoint = reporter.save_checkpoint(
-            {
-                "policy_state": ac.state_dict(),
-                "optimizer_state": opt.state_dict(),
-                "predictor_state": predictor.state_dict() if predictor is not None else None,
-                "f_mem_state": f_mem.state_dict(),
-                "target_policy_state": dqn_target_ac.state_dict() if dqn_target_ac is not None else None,
-                "replay_size": int(len(replay)) if replay is not None else None,
-                "args": vars(args),
-                "frames": updates_completed * args.num_envs * args.horizon,
-                "metrics": final_metrics,
-            }
-        )
+        final_payload = _trace_checkpoint_payload(final_metrics)
+        final_checkpoint = reporter.save_checkpoint(final_payload, filename="checkpoint.pt")
+        reporter.save_checkpoint(final_payload, filename="checkpoint_last.pt")
     finally:
         profiler.close()
         if wandb_run is not None:

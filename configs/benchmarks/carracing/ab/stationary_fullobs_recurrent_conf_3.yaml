@@ -16,6 +16,8 @@ overrides:
   model:
     algo: ppo
     policy: recurrent
+    encoder: cnn
+    cnn_variant: carracing
   training:
     num_envs: 8
     env_workers: 2

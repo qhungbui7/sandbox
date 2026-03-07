@@ -1,3 +1,4 @@
+albumentations==2.0.8
 annotated-types==0.7.0
 asttokens==3.0.1
 box2d==2.3.10

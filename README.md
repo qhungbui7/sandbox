@@ -160,7 +160,7 @@ Beyond the original non-stationary partial-observation setup, this repo now incl
 
 for `CartPole-v1`, `Acrobot-v1`, `MountainCar-v0`, and `CarRacing-v3` (via discrete-action wrapper).
 
-The runner script is `scripts/run_benchmark_matrix.py`. It now runs full-training configs by default, auto-generates per-run plots/gameplay, and writes aggregated mean/std/95% CI summaries.
+The runner script is `scripts/run_benchmark_matrix.py`. It now runs full-training configs by default, auto-generates per-run plots/gameplay (best + last checkpoints), and writes aggregated mean/std/95% CI summaries.
 
 Detailed beginner guide: [`BENCHMARKS_GUIDE.md`](BENCHMARKS_GUIDE.md). End-to-end smoke workflow: [`EXAMPLE_USE_ALL_UTILITIES.md`](EXAMPLE_USE_ALL_UTILITIES.md).
 

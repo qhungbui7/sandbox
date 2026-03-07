@@ -81,6 +81,149 @@ def _load_checkpoint(checkpoint: str | None, run_dir: str | None, device: str) -
     return payload, checkpoint_path
 
 
+def _resolve_checkpoint_for_kind(run_dir: Path, checkpoint_kind: str) -> Path:
+    if checkpoint_kind == "best":
+        candidates = [run_dir / "checkpoint_best.pt", run_dir / "checkpoint.pt"]
+    elif checkpoint_kind == "last":
+        candidates = [run_dir / "checkpoint_last.pt", run_dir / "checkpoint.pt"]
+    else:
+        raise ValueError(f"Unsupported checkpoint kind: {checkpoint_kind}")
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"No checkpoint found for `{checkpoint_kind}` under: {run_dir}")
+
+
+def _resolve_output_video_dir(base_dir: Path, run_name: str, overwrite: bool) -> Path:
+    video_dir = base_dir / run_name
+    if video_dir.exists():
+        if overwrite:
+            shutil.rmtree(video_dir)
+        else:
+            suffix = time.strftime("%Y%m%d_%H%M%S")
+            candidate = video_dir.parent / f"{run_name}_{suffix}"
+            idx = 1
+            while candidate.exists():
+                candidate = video_dir.parent / f"{run_name}_{suffix}_{idx}"
+                idx += 1
+            video_dir = candidate
+    return video_dir
+
+
+def _run_policy_recording(
+    *,
+    payload: dict,
+    device: str,
+    episodes: int,
+    max_steps: int | None,
+    deterministic: bool,
+    video_dir: Path,
+    seed: int,
+    target_steps: int | None,
+    eval_env_id: str | None,
+    eval_stationary: bool,
+    eval_fullobs: bool,
+    record_all_episodes: bool,
+    video_length: int,
+) -> tuple[list[float], list[int]]:
+    run_args = payload.get("args")
+    if not isinstance(run_args, dict):
+        raise ValueError("Checkpoint is missing `args` dictionary.")
+    policy = str(run_args.get("policy", "amt"))
+    if policy == "recurrent":
+        return _record_recurrent(
+            run_args=run_args,
+            checkpoint=payload,
+            device=device,
+            episodes=episodes,
+            max_steps=max_steps,
+            deterministic=deterministic,
+            video_dir=video_dir,
+            seed=seed,
+            target_steps=target_steps,
+            eval_env_id=eval_env_id,
+            eval_stationary=eval_stationary,
+            eval_fullobs=eval_fullobs,
+            record_all_episodes=record_all_episodes,
+            video_length=video_length,
+        )
+    return _record_feedforward(
+        run_args=run_args,
+        checkpoint=payload,
+        device=device,
+        episodes=episodes,
+        max_steps=max_steps,
+        deterministic=deterministic,
+        video_dir=video_dir,
+        seed=seed,
+        target_steps=target_steps,
+        eval_env_id=eval_env_id,
+        eval_stationary=eval_stationary,
+        eval_fullobs=eval_fullobs,
+        record_all_episodes=record_all_episodes,
+        video_length=video_length,
+    )
+
+
+def record_benchmark_run_gameplays(
+    *,
+    run_dir: Path,
+    device: str,
+    checkpoint_kind: str,
+    episodes: int,
+    max_steps: int | None,
+    deterministic: bool,
+    output_dir: Path,
+    name: str | None,
+    seed: int,
+    target_steps: int | None,
+    eval_env_id: str | None,
+    eval_stationary: bool,
+    eval_fullobs: bool,
+    record_all_episodes: bool,
+    video_length: int,
+    overwrite: bool,
+) -> None:
+    kinds = ["best", "last"] if checkpoint_kind == "both" else [checkpoint_kind]
+    base_name = name or run_dir.name
+    for kind in kinds:
+        checkpoint_path = _resolve_checkpoint_for_kind(run_dir=run_dir, checkpoint_kind=kind)
+        payload, _ = _load_checkpoint(checkpoint=str(checkpoint_path), run_dir=None, device=device)
+        suffix = f"_{kind}" if len(kinds) > 1 else ""
+        run_name = f"{base_name}{suffix}"
+        video_dir = _resolve_output_video_dir(base_dir=output_dir, run_name=run_name, overwrite=overwrite)
+        try:
+            returns, lengths = _run_policy_recording(
+                payload=payload,
+                device=device,
+                episodes=episodes,
+                max_steps=max_steps,
+                deterministic=deterministic,
+                video_dir=video_dir,
+                seed=seed,
+                target_steps=target_steps,
+                eval_env_id=eval_env_id,
+                eval_stationary=eval_stationary,
+                eval_fullobs=eval_fullobs,
+                record_all_episodes=record_all_episodes,
+                video_length=video_length,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        videos = sorted(video_dir.glob("*.mp4"))
+        if not videos:
+            raise SystemExit(f"No videos generated in {video_dir}")
+        mean_ret = sum(returns) / max(len(returns), 1)
+        mean_len = sum(lengths) / max(len(lengths), 1)
+        print(f"[{kind}] checkpoint: {checkpoint_path}")
+        print(f"[{kind}] saved {len(videos)} video(s) to: {video_dir}")
+        print(f"[{kind}] episode returns: {returns}")
+        print(f"[{kind}] episode lengths: {lengths}")
+        print(f"[{kind}] mean return={mean_ret:.3f}, mean length={mean_len:.2f}")
+        for video in videos:
+            print(video)
+
+
 def _make_eval_env(
     run_args: dict,
     seed: int,
@@ -422,6 +565,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Record gameplay videos from a training checkpoint.")
     p.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint.pt")
     p.add_argument("--run-dir", type=str, default=None, help="Run directory containing checkpoint.pt")
+    p.add_argument(
+        "--checkpoint-kind",
+        type=str,
+        default="last",
+        choices=["last", "best", "both"],
+        help="Checkpoint selection when --run-dir is provided. `both` records best + last.",
+    )
     default_device = os.environ.get("AMT_DEVICE") or os.environ.get("DEVICE") or "cuda"
     p.add_argument("--device", type=str, default=default_device)
     p.add_argument("--cuda-id", type=int, default=None, help="CUDA device index override (e.g., 0-7).")
@@ -435,7 +585,12 @@ def main() -> None:
         default=None,
         help="Total inference steps across episodes before stopping (useful for longer videos).",
     )
-    p.add_argument("--output-dir", type=str, default="reports/gameplay")
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Base output directory. Defaults to <run-dir>/gameplay when --run-dir is set, else reports/gameplay.",
+    )
     p.add_argument("--name", type=str, default=None, help="Optional output subdir name.")
     p.add_argument("--eval-env-id", type=str, default=None, help="Optional environment override for testing/inference.")
     p.add_argument(
@@ -476,64 +631,62 @@ def main() -> None:
             "GPU selection is required. Pass `--cuda-id <index>` in the command, e.g. `--device cuda --cuda-id 0`."
         )
     device = resolve_device(args.device, args.cuda_id)
+    if args.checkpoint is not None and args.checkpoint_kind == "both":
+        raise ValueError("`--checkpoint-kind both` requires `--run-dir` so best/last checkpoints can be resolved.")
 
-    payload, checkpoint_path = _load_checkpoint(checkpoint=args.checkpoint, run_dir=args.run_dir, device=device)
-    run_args = payload.get("args")
-    if not isinstance(run_args, dict):
-        raise ValueError("Checkpoint is missing `args` dictionary.")
-
-    run_name = args.name or (Path(args.run_dir).name if args.run_dir else checkpoint_path.stem)
     # Headless servers may not have an audio device; keep rendering silent.
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-    video_dir = Path(args.output_dir) / run_name
-    if video_dir.exists():
-        if args.overwrite:
-            shutil.rmtree(video_dir)
-        else:
-            suffix = time.strftime("%Y%m%d_%H%M%S")
-            candidate = video_dir.parent / f"{run_name}_{suffix}"
-            idx = 1
-            while candidate.exists():
-                candidate = video_dir.parent / f"{run_name}_{suffix}_{idx}"
-                idx += 1
-            video_dir = candidate
-    policy = str(run_args.get("policy", "amt"))
+    if args.output_dir is not None:
+        output_dir = Path(args.output_dir)
+    elif args.run_dir is not None:
+        output_dir = Path(args.run_dir) / "gameplay"
+    else:
+        output_dir = Path("reports/gameplay")
+
+    if args.run_dir is not None:
+        run_dir = Path(args.run_dir)
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+        record_benchmark_run_gameplays(
+            run_dir=run_dir,
+            device=device,
+            checkpoint_kind=args.checkpoint_kind,
+            episodes=args.episodes,
+            max_steps=args.max_steps,
+            deterministic=args.deterministic,
+            output_dir=output_dir,
+            name=args.name,
+            seed=args.seed,
+            target_steps=args.target_steps,
+            eval_env_id=args.eval_env_id,
+            eval_stationary=args.eval_stationary,
+            eval_fullobs=args.eval_fullobs,
+            record_all_episodes=args.record_all_episodes,
+            video_length=args.video_length,
+            overwrite=args.overwrite,
+        )
+        return
+
+    payload, checkpoint_path = _load_checkpoint(checkpoint=args.checkpoint, run_dir=None, device=device)
+    run_name = args.name or checkpoint_path.stem
+    video_dir = _resolve_output_video_dir(base_dir=output_dir, run_name=run_name, overwrite=args.overwrite)
     try:
-        if policy == "recurrent":
-            returns, lengths = _record_recurrent(
-                run_args=run_args,
-                checkpoint=payload,
-                device=device,
-                episodes=args.episodes,
-                max_steps=args.max_steps,
-                deterministic=args.deterministic,
-                video_dir=video_dir,
-                seed=args.seed,
-                target_steps=args.target_steps,
-                eval_env_id=args.eval_env_id,
-                eval_stationary=args.eval_stationary,
-                eval_fullobs=args.eval_fullobs,
-                record_all_episodes=args.record_all_episodes,
-                video_length=args.video_length,
-            )
-        else:
-            returns, lengths = _record_feedforward(
-                run_args=run_args,
-                checkpoint=payload,
-                device=device,
-                episodes=args.episodes,
-                max_steps=args.max_steps,
-                deterministic=args.deterministic,
-                video_dir=video_dir,
-                seed=args.seed,
-                target_steps=args.target_steps,
-                eval_env_id=args.eval_env_id,
-                eval_stationary=args.eval_stationary,
-                eval_fullobs=args.eval_fullobs,
-                record_all_episodes=args.record_all_episodes,
-                video_length=args.video_length,
-            )
+        returns, lengths = _run_policy_recording(
+            payload=payload,
+            device=device,
+            episodes=args.episodes,
+            max_steps=args.max_steps,
+            deterministic=args.deterministic,
+            video_dir=video_dir,
+            seed=args.seed,
+            target_steps=args.target_steps,
+            eval_env_id=args.eval_env_id,
+            eval_stationary=args.eval_stationary,
+            eval_fullobs=args.eval_fullobs,
+            record_all_episodes=args.record_all_episodes,
+            video_length=args.video_length,
+        )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -543,6 +696,7 @@ def main() -> None:
 
     mean_ret = sum(returns) / max(len(returns), 1)
     mean_len = sum(lengths) / max(len(lengths), 1)
+    print(f"checkpoint: {checkpoint_path}")
     print(f"Saved {len(videos)} video(s) to: {video_dir}")
     print(f"Episode returns: {returns}")
     print(f"Episode lengths: {lengths}")

@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 
 def load_env_file(path: str | Path | None = None) -> None:
     """Load key=value pairs from a .env file into os.environ."""
@@ -65,9 +68,20 @@ def _is_uint8_dtype(dtype: object) -> bool:
         return False
 
 
+def _imagenet_stats(num_channels: int, *, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if num_channels < 1:
+        raise ValueError(f"Expected channel dimension >= 1, got {num_channels}")
+    base_mean = like.new_tensor(IMAGENET_MEAN)
+    base_std = like.new_tensor(IMAGENET_STD)
+    if num_channels == 1:
+        return base_mean.mean().reshape(1), base_std.mean().reshape(1)
+    repeats = (num_channels + 2) // 3
+    return base_mean.repeat(repeats)[:num_channels], base_std.repeat(repeats)[:num_channels]
+
+
 def obs_to_tensor(obs, *, device: str, obs_normalization: str = "auto") -> torch.Tensor:
     mode = str(obs_normalization).strip().lower()
-    if mode not in {"auto", "none", "uint8"}:
+    if mode not in {"auto", "none", "uint8", "imagenet"}:
         raise ValueError(f"Unsupported obs normalization mode: {obs_normalization}")
     source_dtype = getattr(obs, "dtype", None)
     out = torch.as_tensor(obs, device=device, dtype=torch.float32)
@@ -75,6 +89,19 @@ def obs_to_tensor(obs, *, device: str, obs_normalization: str = "auto") -> torch
         return out
     if mode == "uint8":
         return out / 255.0
+    if mode == "imagenet":
+        if out.ndim < 3:
+            raise ValueError(
+                "`obs_normalization=imagenet` expects image observations with a channel-last axis "
+                "(e.g., [B,H,W,C] or [H,W,C])."
+            )
+        if _is_uint8_dtype(source_dtype):
+            out = out / 255.0
+        channels = int(out.shape[-1])
+        mean, std = _imagenet_stats(channels, like=out)
+        shape = [1] * out.ndim
+        shape[-1] = channels
+        return (out - mean.view(*shape)) / std.view(*shape)
     if _is_uint8_dtype(source_dtype):
         return out / 255.0
     return out

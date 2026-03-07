@@ -6,8 +6,8 @@ config_paths:
 overrides:
   env:
     env_id: CarRacing-v3
-    carracing_downsample: 2
-    carracing_grayscale: true
+    carracing_downsample: 2 # 2
+    carracing_grayscale: true # false # true
     mask_indices: []
     phase_len: 0
     obs_shift_scale: 0.0
@@ -22,16 +22,19 @@ overrides:
     num_envs: 8
     env_workers: 2
     horizon: 256
-    total_steps: 102400
-    epochs: 2
-    ent_coef: 0.001
+    total_steps: 1001472 # 102400 # 5001216
+    epochs: 8
+    ent_coef: 1e-3
     vf_coef: 0.25
-    max_grad_norm: 1.0
-    lr: 0.00001
+    max_grad_norm: 0.5
+    lr_schedule: linear
+    lr: 0.0003
+    lr_end: 1e-5
+    target_kl : 0.01
   other:
     device: cuda
     seed: 0
     wandb: false
     report: true
     report_dir: reports/benchmarks
-    report_run_name: carracing_stationary_fullobs_recurrent_vf025_gn1_lr3e5
+    report_run_name: carracing_stationary_fullobs_recurrent_vf025_gn1_lr1e-3

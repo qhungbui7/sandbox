@@ -1,7 +1,8 @@
 import numpy as np
 import gymnasium as gym
+import pytest
 
-from src.envs import DiscreteCarRacingWrapper, FrameStackLastAxisWrapper
+from src.envs import CarRacingPreprocessWrapper, DiscreteCarRacingWrapper, FrameStackLastAxisWrapper
 
 
 class DummyCarEnv(gym.Env):
@@ -125,3 +126,19 @@ def test_frame_stack_wrapper_stacks_last_axis():
     assert np.all(obs2[..., :2] == 1)
     assert np.all(obs2[..., 2:3] == 2)
     assert np.all(obs2[..., 3:] == 3)
+
+
+def test_carracing_preprocess_wrapper_downsample_and_grayscale():
+    env = DummyCarEnv()
+    try:
+        wrapped = CarRacingPreprocessWrapper(env, downsample=2, grayscale=True)
+    except ImportError:
+        pytest.skip("albumentations is not installed")
+
+    obs0, _ = wrapped.reset(seed=0)
+    assert obs0.shape == (4, 4, 1)
+    assert obs0.dtype == np.uint8
+
+    obs1, _, _, _, _ = wrapped.step(0)
+    assert obs1.shape == (4, 4, 1)
+    assert obs1.dtype == np.uint8

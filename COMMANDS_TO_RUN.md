@@ -308,6 +308,18 @@ Record gameplay videos:
   --output-dir reports/gameplay
 ```
 
+Record benchmark gameplay for both checkpoints (`best` + `last`, 4 videos total with `--episodes 2`):
+
+```bash
+.venv/bin/python scripts/record_gameplay.py \
+  --run-dir /raid/nobackup/trustvision/hungbui/workspace/per/amt/reports/benchmarks/ab_stationary_fullobs_recurrent_conf_4_bigger_ppo_s0_vfclip-ab-stablized-complex-discrete-joystick-long-grayscale-downscale \
+  --checkpoint-kind both \
+  --episodes 2 \
+  --device cuda \
+  --cuda-id ${GPU_ID} \
+  --output-dir reports/benchmarks/gameplay
+```
+
 Long inference-style video:
 
 ```bash
