@@ -611,6 +611,64 @@ def test_recurrent_rollout_and_update_cpu():
     assert "truncated" in batch
 
 
+def test_recurrent_rollout_and_update_without_prev_action_cpu():
+    set_seed(2)
+    device = "cpu"
+    envs, obs0 = _build_envs(num_envs=2, seed=2)
+
+    obs_dim = int(np.prod(envs.single_observation_space.shape))
+    act_dim = int(envs.single_action_space.n)
+    feat_dim = 16
+    hidden_dim = 32
+
+    ac = RecurrentActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        use_prev_action=False,
+    ).to(device)
+
+    hidden = ac.init_hidden(envs.num_envs, device)
+    batch, _obs, prev_action, _hidden = rollout_recurrent(
+        envs=envs,
+        ac=ac,
+        device=device,
+        horizon=6,
+        gamma=0.99,
+        obs_normalization="none",
+        obs=obs0,
+        prev_action=None,
+        hidden=hidden,
+    )
+    assert batch["prev_action"] is None
+    assert prev_action is None
+
+    stats = ppo_update_recurrent(
+        ac=ac,
+        opt=torch.optim.Adam(ac.parameters(), lr=1e-3),
+        batch=batch,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        lam=0.95,
+        gamma=0.99,
+        generator=torch.Generator(device=device).manual_seed(2),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+    )
+    for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
+        assert key in stats
+        assert torch.isfinite(torch.tensor(stats[key]))
+
+
 def test_ppo_update_recurrent_resets_hidden_on_done_boundaries():
     device = "cpu"
     T, N = 2, 1

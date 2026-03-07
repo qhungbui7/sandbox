@@ -127,8 +127,8 @@ def ppo_update(
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
-    prev_a = batch["prev_action"]
-    traces = batch["traces"]
+    prev_a = batch.get("prev_action", None)
+    traces = batch.get("traces", None)
     actions = batch["actions"]
     logp_old = batch["logp_old"]
     values_old = batch["values_old"]
@@ -145,11 +145,13 @@ def ppo_update(
     b = T * N
 
     obs_f = obs.reshape((b, *obs.shape[2:]))
-    if prev_a.ndim == 2:
+    if prev_a is None:
+        prev_a_f = None
+    elif prev_a.ndim == 2:
         prev_a_f = prev_a.reshape(b)
     else:
         prev_a_f = prev_a.reshape(b, -1)
-    traces_f = traces.reshape(b, -1)
+    traces_f = traces.reshape(b, -1) if traces is not None else None
     if actions.ndim == 2:
         actions_f = actions.reshape(b)
     else:
@@ -158,8 +160,8 @@ def ppo_update(
     values_old_f = values_old.reshape(b)
     adv_f = adv.reshape(b)
     returns_f = returns.reshape(b)
-    x_mem_f = x_mem.reshape(b, -1)
-    x_mem_next_f = x_mem_next.reshape(b, -1)
+    x_mem_f = x_mem.reshape(b, -1) if x_mem is not None else None
+    x_mem_next_f = x_mem_next.reshape(b, -1) if x_mem_next is not None else None
 
     adv_f = (adv_f - adv_f.mean()) / (adv_f.std(unbiased=False) + 1e-8)
 
@@ -181,7 +183,9 @@ def ppo_update(
             mb = perm[start : start + minibatch_size]
 
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                policy_out, values = ac(obs_f[mb], prev_a_f[mb], traces_f[mb])
+                prev_a_mb = prev_a_f[mb] if prev_a_f is not None else None
+                traces_mb = traces_f[mb] if traces_f is not None else None
+                policy_out, values = ac(obs_f[mb], prev_a_mb, traces_mb)
                 logp, entropy, _max_action_prob = evaluate_policy_actions(
                     policy_out=policy_out,
                     actions=actions_f[mb],
@@ -206,6 +210,8 @@ def ppo_update(
 
                 pred_loss = torch.tensor(0.0, device=obs.device)
                 if (pred is not None) and (pred_coef > 0.0):
+                    if x_mem_f is None or x_mem_next_f is None:
+                        raise RuntimeError("Predictor loss requires trace memory features (x_mem/x_mem_next).")
                     x_hat = pred(x_mem_f[mb], actions_f[mb])
                     pred_loss = (x_mem_next_f[mb] - x_hat).pow(2).mean()
 
@@ -274,7 +280,7 @@ def ppo_update_recurrent(
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
-    prev_a = batch["prev_action"]
+    prev_a = batch.get("prev_action", None)
     actions = batch["actions"]
     logp_old = batch["logp_old"]
     values_old = batch["values_old"]
@@ -377,7 +383,8 @@ def ppo_update_recurrent(
 
             for t in range(T):
                 with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                    policy_out, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
+                    prev_a_t = prev_a[t, env_id : env_id + 1] if prev_a is not None else None
+                    policy_out, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a_t, (h, c))
                     action_t = actions[t, env_id : env_id + 1]
                     logp_t, entropy_t, max_prob_t = evaluate_policy_actions(
                         policy_out=policy_out,

@@ -225,6 +225,92 @@ def test_on_policy_algorithm_updates_cpu():
             assert torch.isfinite(torch.tensor(stats[key]))
 
 
+def test_ppo_update_supports_plain_mode_without_prev_action_or_traces():
+    set_seed(21)
+    device = "cpu"
+    envs, obs0 = _build_envs(num_envs=2, seed=21)
+    obs_dim = int(np.prod(envs.single_observation_space.shape))
+    act_dim = int(envs.single_action_space.n)
+    feat_dim = 16
+    hidden_dim = 32
+
+    ac = ActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        mem_dim=0,
+        use_prev_action=False,
+        use_traces=False,
+    ).to(device)
+    alpha_base = torch.tensor([1.0], device=device).unsqueeze(0)
+    alpha_max = torch.tensor([1.0], device=device).unsqueeze(0)
+
+    batch, _obs, prev_action_out, traces_out = rollout(
+        envs=envs,
+        ac=ac,
+        f_mem=None,
+        drift=None,
+        predictor=None,
+        device=device,
+        horizon=8,
+        gamma=0.99,
+        lambda_pred=0.0,
+        obs_normalization="none",
+        alpha_base=alpha_base,
+        alpha_max=alpha_max,
+        reset_strategy="none",
+        reset_long_fraction=0.5,
+        obs=obs0,
+        prev_action=None,
+        traces=None,
+    )
+    assert batch["prev_action"] is None
+    assert batch["traces"] is None
+    assert batch["x_mem"] is None
+    assert batch["x_mem_next"] is None
+    assert prev_action_out is None
+    assert traces_out is None
+
+    stats = update_on_policy(
+        algo="ppo",
+        ac=ac,
+        opt=torch.optim.Adam(ac.parameters(), lr=1e-3),
+        batch=batch,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        minibatch_size=4,
+        lam=0.95,
+        gamma=0.99,
+        pred=None,
+        pred_coef=0.0,
+        generator=torch.Generator(device=device).manual_seed(21),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+        trpo_max_kl=0.01,
+        trpo_backtrack_coef=0.5,
+        trpo_backtrack_iters=5,
+        trpo_value_epochs=1,
+        vtrace_rho_clip=1.0,
+        vtrace_c_clip=1.0,
+        vmpo_topk_frac=0.5,
+        vmpo_eta=1.0,
+        vmpo_kl_coef=1.0,
+        vmpo_kl_target=0.01,
+    )
+    for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
+        assert key in stats
+        assert torch.isfinite(torch.tensor(stats[key]))
+
+
 def test_dqn_collect_and_update_cpu():
     set_seed(1)
     device = "cpu"

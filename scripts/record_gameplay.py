@@ -13,13 +13,13 @@ import gymnasium as gym
 import torch
 from gymnasium import error as gym_error
 from gymnasium.wrappers import RecordVideo
-from torch.distributions.categorical import Categorical
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.amt import DriftMonitor, encode_mem, maybe_reset_traces, trace_update
+from src.action_utils import actions_to_env_numpy, init_prev_action, sample_policy_actions
 from src.envs import (
     CarRacingPreprocessWrapper,
     DiscreteCarRacingWrapper,
@@ -64,6 +64,84 @@ def _parse_ints(value) -> list[int]:
     if isinstance(value, str):
         return [int(x.strip()) for x in value.split(",") if x.strip()]
     return [int(value)]
+
+
+def _parse_optional_bool(value) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _infer_action_mode(run_args: dict, policy_state: dict) -> str:
+    for key in ("resolved_action_mode", "action_space"):
+        raw = run_args.get(key)
+        if isinstance(raw, str):
+            mode = raw.strip().lower()
+            if mode in {"discrete", "continuous"}:
+                return mode
+
+    if ("pi_log_std" in policy_state) or any(str(k).startswith("pi_mean.") for k in policy_state):
+        return "continuous"
+    if any(str(k).startswith("pi.") for k in policy_state):
+        return "discrete"
+    raise ValueError("Unable to infer action mode from checkpoint args/state.")
+
+
+def _infer_use_prev_action(run_args: dict, policy_state: dict) -> bool:
+    explicit = _parse_optional_bool(run_args.get("use_prev_action"))
+    if explicit is not None:
+        return explicit
+    return any(
+        str(key).startswith("f_pol.act_emb.")
+        or str(key).startswith("f_pol.act_proj.")
+        or str(key).startswith("f_pol.fuse.")
+        for key in policy_state
+    )
+
+
+def _infer_use_traces(run_args: dict, checkpoint: dict, policy_state: dict, feat_dim: int) -> bool:
+    explicit = _parse_optional_bool(run_args.get("use_traces"))
+    if explicit is not None:
+        return explicit
+    if str(run_args.get("policy", "")).lower() == "recurrent":
+        return False
+    if checkpoint.get("f_mem_state") is not None:
+        return True
+    core_weight = policy_state.get("core.net.0.weight")
+    if isinstance(core_weight, torch.Tensor):
+        return int(core_weight.shape[1]) > int(feat_dim)
+    return False
+
+
+def _resolve_action_spec(
+    env: gym.Env, action_mode: str
+) -> tuple[int, tuple[int, ...], object | None, object | None]:
+    mode = str(action_mode)
+    if mode == "discrete":
+        if not isinstance(env.action_space, gym.spaces.Discrete):
+            raise TypeError(
+                f"Checkpoint expects a discrete action space, got {type(env.action_space)} from eval env."
+            )
+        return int(env.action_space.n), (), None, None
+    if mode == "continuous":
+        if not isinstance(env.action_space, gym.spaces.Box):
+            raise TypeError(
+                f"Checkpoint expects a continuous action space, got {type(env.action_space)} from eval env."
+            )
+        action_shape = tuple(int(x) for x in env.action_space.shape)
+        act_dim = int(math.prod(action_shape))
+        action_low = env.action_space.low.reshape(-1).astype("float32", copy=False)
+        action_high = env.action_space.high.reshape(-1).astype("float32", copy=False)
+        return act_dim, action_shape, action_low, action_high
+    raise ValueError(f"Unsupported action mode: {action_mode}")
 
 
 def _load_checkpoint(checkpoint: str | None, run_dir: str | None, device: str) -> tuple[dict, Path]:
@@ -228,6 +306,7 @@ def _make_eval_env(
     run_args: dict,
     seed: int,
     video_dir: Path,
+    action_mode: str,
     eval_env_id: str | None,
     eval_stationary: bool,
     eval_fullobs: bool,
@@ -237,7 +316,10 @@ def _make_eval_env(
     env_id = eval_env_id or run_args.get("env_id", "CartPole-v1")
     env = gym.make(env_id, render_mode="rgb_array")
     if str(env_id).startswith("CarRacing"):
-        env = DiscreteCarRacingWrapper(env)
+        if str(action_mode) == "discrete":
+            env = DiscreteCarRacingWrapper(env)
+        elif str(action_mode) != "continuous":
+            raise ValueError(f"Unsupported CarRacing action mode: {action_mode}")
         env = CarRacingPreprocessWrapper(
             env,
             downsample=int(run_args.get("carracing_downsample", 1)),
@@ -301,10 +383,16 @@ def _record_feedforward(
     record_all_episodes: bool,
     video_length: int,
 ) -> tuple[list[float], list[int]]:
+    policy_state = checkpoint.get("policy_state")
+    if not isinstance(policy_state, dict):
+        raise ValueError("Checkpoint is missing `policy_state` dictionary.")
+    action_mode = _infer_action_mode(run_args=run_args, policy_state=policy_state)
+
     env = _make_eval_env(
         run_args=run_args,
         seed=seed,
         video_dir=video_dir,
+        action_mode=action_mode,
         eval_env_id=eval_env_id,
         eval_stationary=eval_stationary,
         eval_fullobs=eval_fullobs,
@@ -313,17 +401,28 @@ def _record_feedforward(
     )
     try:
         assert isinstance(env.observation_space, gym.spaces.Box)
-        assert isinstance(env.action_space, gym.spaces.Discrete)
         obs_dim = int(math.prod(env.observation_space.shape))
-        act_dim = int(env.action_space.n)
+        act_dim, action_shape, action_low, action_high = _resolve_action_spec(env=env, action_mode=action_mode)
         feat_dim = int(run_args.get("feat_dim", 64))
-
-        alpha_base_list = _parse_floats(run_args.get("alpha_base", "0.5,0.1,0.01"))
-        alpha_max_list = _parse_floats(run_args.get("alpha_max", "1.0,0.5,0.2"))
-        if len(alpha_base_list) != len(alpha_max_list):
-            raise ValueError("alpha_base and alpha_max lengths do not match.")
-        M = len(alpha_base_list)
-        mem_dim = M * feat_dim
+        use_prev_action = _infer_use_prev_action(run_args=run_args, policy_state=policy_state)
+        use_traces = _infer_use_traces(
+            run_args=run_args,
+            checkpoint=checkpoint,
+            policy_state=policy_state,
+            feat_dim=feat_dim,
+        )
+        core_weight = policy_state.get("core.net.0.weight")
+        inferred_mem_dim = 0
+        if isinstance(core_weight, torch.Tensor):
+            inferred_mem_dim = max(int(core_weight.shape[1]) - feat_dim, 0)
+        if inferred_mem_dim > 0:
+            use_traces = True
+        mem_dim = inferred_mem_dim if use_traces else 0
+        if use_traces and (mem_dim <= 0):
+            raise ValueError("Trace policy checkpoint inferred, but trace memory dimension is zero.")
+        if use_traces and ((mem_dim % feat_dim) != 0):
+            raise ValueError(f"Incompatible trace memory: mem_dim={mem_dim}, feat_dim={feat_dim}")
+        M = (mem_dim // feat_dim) if use_traces else 0
 
         ac = ActorCritic(
             obs_dim=obs_dim,
@@ -334,44 +433,77 @@ def _record_feedforward(
             mem_dim=mem_dim,
             encoder_type=str(run_args.get("encoder", "mlp")),
             obs_shape=tuple(env.observation_space.shape),
+            action_type=action_mode,
+            use_prev_action=use_prev_action,
+            use_traces=use_traces,
         ).to(device)
-        ac.load_state_dict(checkpoint["policy_state"])
+        ac.load_state_dict(policy_state)
         ac.eval()
 
-        f_mem = FeatureEncoder(
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-            act_embed_dim=int(run_args.get("act_embed_dim", 16)),
-            hidden_dim=int(run_args.get("hidden_dim", 128)),
-            feat_dim=feat_dim,
-            encoder_type=str(run_args.get("encoder", "mlp")),
-            obs_shape=tuple(env.observation_space.shape),
-        ).to(device)
-        if checkpoint.get("f_mem_state") is not None:
-            f_mem.load_state_dict(checkpoint["f_mem_state"])
-        else:
-            f_mem.load_state_dict(ac.f_pol.state_dict())
-        f_mem.eval()
+        f_mem = None
+        if use_traces:
+            f_mem = FeatureEncoder(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                act_embed_dim=int(run_args.get("act_embed_dim", 16)),
+                hidden_dim=int(run_args.get("hidden_dim", 128)),
+                feat_dim=feat_dim,
+                encoder_type=str(run_args.get("encoder", "mlp")),
+                obs_shape=tuple(env.observation_space.shape),
+                action_type=action_mode,
+                use_prev_action=use_prev_action,
+            ).to(device)
+        if f_mem is not None:
+            if checkpoint.get("f_mem_state") is not None:
+                f_mem.load_state_dict(checkpoint["f_mem_state"])
+            else:
+                f_mem.load_state_dict(ac.f_pol.state_dict())
+            f_mem.eval()
 
         predictor = None
-        if checkpoint.get("predictor_state") is not None:
-            predictor = Predictor(feat_dim=feat_dim, act_dim=act_dim, hidden_dim=int(run_args.get("hidden_dim", 128))).to(
-                device
-            )
+        if use_traces and (checkpoint.get("predictor_state") is not None):
+            predictor = Predictor(
+                feat_dim=feat_dim,
+                act_dim=act_dim,
+                hidden_dim=int(run_args.get("hidden_dim", 128)),
+                action_type=action_mode,
+            ).to(device)
             predictor.load_state_dict(checkpoint["predictor_state"])
             predictor.eval()
 
-        alpha_base = torch.tensor(alpha_base_list, device=device, dtype=torch.float32).unsqueeze(0)
-        alpha_max = torch.tensor(alpha_max_list, device=device, dtype=torch.float32).unsqueeze(0)
         gamma = float(run_args.get("gamma", 0.99))
         lambda_pred = float(run_args.get("lambda_pred", 0.0))
         reset_strategy = str(run_args.get("reset_strategy", "none"))
         reset_long_fraction = float(run_args.get("reset_long_fraction", 0.5))
+        alpha_base = None
+        alpha_max = None
+        long_mask = None
+        skip_drift = True
+        if use_traces:
+            alpha_base_list = _parse_floats(run_args.get("alpha_base", "1.0"))
+            alpha_max_list = _parse_floats(run_args.get("alpha_max", "1.0"))
+            if not alpha_base_list:
+                alpha_base_list = [1.0]
+            if not alpha_max_list:
+                alpha_max_list = [1.0]
+            if len(alpha_base_list) == 1 and M > 1:
+                alpha_base_list = alpha_base_list * M
+            if len(alpha_max_list) == 1 and M > 1:
+                alpha_max_list = alpha_max_list * M
+            if len(alpha_base_list) != len(alpha_max_list):
+                raise ValueError("alpha_base and alpha_max lengths do not match.")
+            if len(alpha_base_list) != M:
+                raise ValueError(
+                    f"Trace count mismatch: checkpoint implies M={M}, but alpha schedule has {len(alpha_base_list)} values."
+                )
+            alpha_base = torch.tensor(alpha_base_list, device=device, dtype=torch.float32).unsqueeze(0)
+            alpha_max = torch.tensor(alpha_max_list, device=device, dtype=torch.float32).unsqueeze(0)
+            skip_drift = (reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
 
-        long_start = int(math.floor((1.0 - reset_long_fraction) * M))
-        long_mask = torch.zeros(M, device=device, dtype=torch.bool)
-        if reset_strategy == "partial":
-            long_mask[long_start:] = True
+            long_start = int(math.floor((1.0 - reset_long_fraction) * M))
+            long_mask = torch.zeros(M, device=device, dtype=torch.bool)
+            if reset_strategy == "partial":
+                long_mask[long_start:] = True
 
         returns: list[float] = []
         lengths: list[int] = []
@@ -380,29 +512,37 @@ def _record_feedforward(
         episode_idx = 0
         while (episode_idx < episodes) and ((target_steps is None) or (total_steps < target_steps)):
             obs_np, _ = env.reset(seed=seed + episode_idx)
-            prev_action = torch.zeros(1, device=device, dtype=torch.int64)
-            traces = torch.zeros((1, M, feat_dim), device=device)
+            prev_action = (
+                init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device)
+                if use_prev_action
+                else None
+            )
             obs_t = obs_to_tensor(
                 obs_np,
                 device=device,
                 obs_normalization=str(run_args.get("obs_normalization", "auto")),
             ).unsqueeze(0)
-            x_mem0 = encode_mem(f_mem, obs_t, prev_action)
-            traces = trace_update(traces, x_mem0, alpha_base.expand(1, -1))
-            drift = DriftMonitor(
-                num_envs=1,
-                rho_s=float(run_args.get("rho_s", 0.1)),
-                rho_l=float(run_args.get("rho_l", 0.01)),
-                beta=float(run_args.get("beta", 0.01)),
-                tau_soft=float(run_args.get("tau_soft", 1.0)),
-                kappa=float(run_args.get("kappa", 0.5)),
-                tau_on=float(run_args.get("tau_on", 2.5)),
-                tau_off=float(run_args.get("tau_off", 1.5)),
-                K=int(run_args.get("K", 5)),
-                cooldown_steps=int(run_args.get("cooldown_steps", 200)),
-                warmup_steps=int(run_args.get("warmup_steps", 1000)),
-                device=device,
-            )
+            traces = None
+            drift = None
+            if use_traces:
+                traces = torch.zeros((1, M, feat_dim), device=device)
+                x_mem0 = encode_mem(f_mem, obs_t, prev_action)
+                traces = trace_update(traces, x_mem0, alpha_base.expand(1, -1))
+                if not skip_drift:
+                    drift = DriftMonitor(
+                        num_envs=1,
+                        rho_s=float(run_args.get("rho_s", 0.1)),
+                        rho_l=float(run_args.get("rho_l", 0.01)),
+                        beta=float(run_args.get("beta", 0.01)),
+                        tau_soft=float(run_args.get("tau_soft", 1.0)),
+                        kappa=float(run_args.get("kappa", 0.5)),
+                        tau_on=float(run_args.get("tau_on", 2.5)),
+                        tau_off=float(run_args.get("tau_off", 1.5)),
+                        K=int(run_args.get("K", 5)),
+                        cooldown_steps=int(run_args.get("cooldown_steps", 200)),
+                        warmup_steps=int(run_args.get("warmup_steps", 1000)),
+                        device=device,
+                    )
 
             ep_ret = 0.0
             ep_len = 0
@@ -410,52 +550,79 @@ def _record_feedforward(
             if target_steps is not None:
                 step_budget = min(step_budget, max(target_steps - total_steps, 0))
             for _ in range(step_budget):
-                logits, value = ac(obs_t, prev_action, traces.reshape(1, -1))
-                dist = Categorical(logits=logits)
-                action = logits.argmax(dim=-1) if deterministic else dist.sample()
-
-                next_obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+                traces_flat = traces.reshape(1, -1) if use_traces else None
+                policy_out, value = ac(obs_t, prev_action, traces_flat)
+                action, _logp, _entropy, _max_action_stat = sample_policy_actions(
+                    policy_out=policy_out,
+                    action_mode=action_mode,
+                    deterministic=deterministic,
+                    action_low=action_low,
+                    action_high=action_high,
+                )
+                env_action = actions_to_env_numpy(
+                    actions=action,
+                    action_mode=action_mode,
+                    action_shape=action_shape,
+                    action_low=action_low,
+                    action_high=action_high,
+                )[0]
+                step_action = int(env_action) if action_mode == "discrete" else env_action
+                next_obs, reward, terminated, truncated, _ = env.step(step_action)
                 done = bool(terminated or truncated)
                 rew = torch.tensor([float(reward)], device=device)
                 done_t = torch.tensor([done], device=device, dtype=torch.bool)
 
-                x_mem_t = encode_mem(f_mem, obs_t, prev_action)
                 next_obs_t = obs_to_tensor(
                     next_obs,
                     device=device,
                     obs_normalization=str(run_args.get("obs_normalization", "auto")),
                 ).unsqueeze(0)
-                next_prev_action = action
-                x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
-                _, v_next_prov = ac(
-                    next_obs_t,
-                    next_prev_action,
-                    trace_update(traces, x_mem_next, alpha_base.expand(1, -1)).reshape(1, -1),
-                )
+                if use_prev_action:
+                    next_prev_action = action.clone()
+                    if done:
+                        if action_mode == "continuous":
+                            next_prev_action[0] = 0.0
+                        else:
+                            next_prev_action[0] = 0
+                else:
+                    next_prev_action = None
 
-                delta = rew + gamma * (~done_t).float() * v_next_prov - value
-                pred_err = torch.zeros(1, device=device)
-                if (predictor is not None) and (lambda_pred > 0.0):
-                    pred_err = (x_mem_next - predictor(x_mem_t, action)).pow(2).mean(dim=-1)
-                e = delta.abs() + lambda_pred * pred_err
+                if use_traces:
+                    x_mem_t = encode_mem(f_mem, obs_t, prev_action)
+                    x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
+                    if skip_drift:
+                        traces_next = trace_update(traces, x_mem_next, alpha_base.expand(1, -1))
+                    else:
+                        _, v_next_prov = ac(
+                            next_obs_t,
+                            next_prev_action,
+                            trace_update(traces, x_mem_next, alpha_base.expand(1, -1)).reshape(1, -1),
+                        )
 
-                gate, reset_event = drift.update(e)
-                reset_event = reset_event & (~done_t)
-                alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
-                alpha = alpha.clamp(0.0, 1.0)
-                traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
-                traces_next = trace_update(traces_reset, x_mem_next, alpha)
+                        delta = rew + gamma * (~done_t).float() * v_next_prov - value
+                        pred_err = torch.zeros(1, device=device)
+                        if (predictor is not None) and (lambda_pred > 0.0):
+                            pred_err = (x_mem_next - predictor(x_mem_t, action)).pow(2).mean(dim=-1)
+                        e = delta.abs() + lambda_pred * pred_err
 
-                if done:
-                    drift.reset_where(done_t)
-                    traces_next[done_t] = 0.0
-                    traces_next[done_t] = trace_update(
-                        traces_next[done_t],
-                        x_mem_next[done_t],
-                        alpha_base.expand(done_t.sum(), -1),
-                    )
+                        gate, reset_event = drift.update(e)
+                        reset_event = reset_event & (~done_t)
+                        alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
+                        alpha = alpha.clamp(0.0, 1.0)
+                        traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
+                        traces_next = trace_update(traces_reset, x_mem_next, alpha)
 
-                traces = traces_next
+                    if done:
+                        if drift is not None:
+                            drift.reset_where(done_t)
+                        traces_next[done_t] = 0.0
+                        traces_next[done_t] = trace_update(
+                            traces_next[done_t],
+                            x_mem_next[done_t],
+                            alpha_base.expand(done_t.sum(), -1),
+                        )
+
+                    traces = traces_next
                 prev_action = next_prev_action
                 obs_t = next_obs_t
 
@@ -489,10 +656,16 @@ def _record_recurrent(
     record_all_episodes: bool,
     video_length: int,
 ) -> tuple[list[float], list[int]]:
+    policy_state = checkpoint.get("policy_state")
+    if not isinstance(policy_state, dict):
+        raise ValueError("Checkpoint is missing `policy_state` dictionary.")
+    action_mode = _infer_action_mode(run_args=run_args, policy_state=policy_state)
+
     env = _make_eval_env(
         run_args=run_args,
         seed=seed,
         video_dir=video_dir,
+        action_mode=action_mode,
         eval_env_id=eval_env_id,
         eval_stationary=eval_stationary,
         eval_fullobs=eval_fullobs,
@@ -501,9 +674,9 @@ def _record_recurrent(
     )
     try:
         assert isinstance(env.observation_space, gym.spaces.Box)
-        assert isinstance(env.action_space, gym.spaces.Discrete)
         obs_dim = int(math.prod(env.observation_space.shape))
-        act_dim = int(env.action_space.n)
+        act_dim, action_shape, action_low, action_high = _resolve_action_spec(env=env, action_mode=action_mode)
+        use_prev_action = _infer_use_prev_action(run_args=run_args, policy_state=policy_state)
 
         ac = RecurrentActorCritic(
             obs_dim=obs_dim,
@@ -513,8 +686,10 @@ def _record_recurrent(
             feat_dim=int(run_args.get("feat_dim", 64)),
             encoder_type=str(run_args.get("encoder", "mlp")),
             obs_shape=tuple(env.observation_space.shape),
+            action_type=action_mode,
+            use_prev_action=use_prev_action,
         ).to(device)
-        ac.load_state_dict(checkpoint["policy_state"])
+        ac.load_state_dict(policy_state)
         ac.eval()
 
         returns: list[float] = []
@@ -529,7 +704,11 @@ def _record_recurrent(
                 device=device,
                 obs_normalization=str(run_args.get("obs_normalization", "auto")),
             ).unsqueeze(0)
-            prev_action = torch.zeros(1, device=device, dtype=torch.int64)
+            prev_action = (
+                init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device)
+                if use_prev_action
+                else None
+            )
             hidden = ac.init_hidden(batch_size=1, device=device)
 
             ep_ret = 0.0
@@ -538,16 +717,38 @@ def _record_recurrent(
             if target_steps is not None:
                 step_budget = min(step_budget, max(target_steps - total_steps, 0))
             for _ in range(step_budget):
-                logits, _, hidden = ac(obs_t, prev_action, hidden)
-                action = logits.argmax(dim=-1) if deterministic else Categorical(logits=logits).sample()
-                next_obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+                policy_out, _, hidden = ac(obs_t, prev_action, hidden)
+                action, _logp, _entropy, _max_action_stat = sample_policy_actions(
+                    policy_out=policy_out,
+                    action_mode=action_mode,
+                    deterministic=deterministic,
+                    action_low=action_low,
+                    action_high=action_high,
+                )
+                env_action = actions_to_env_numpy(
+                    actions=action,
+                    action_mode=action_mode,
+                    action_shape=action_shape,
+                    action_low=action_low,
+                    action_high=action_high,
+                )[0]
+                step_action = int(env_action) if action_mode == "discrete" else env_action
+                next_obs, reward, terminated, truncated, _ = env.step(step_action)
                 done = bool(terminated or truncated)
                 obs_t = obs_to_tensor(
                     next_obs,
                     device=device,
                     obs_normalization=str(run_args.get("obs_normalization", "auto")),
                 ).unsqueeze(0)
-                prev_action = action
+                if use_prev_action:
+                    prev_action = action.clone()
+                    if done:
+                        if action_mode == "continuous":
+                            prev_action[0] = 0.0
+                        else:
+                            prev_action[0] = 0
+                else:
+                    prev_action = None
                 ep_ret += float(reward)
                 ep_len += 1
                 total_steps += 1
