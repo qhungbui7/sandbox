@@ -5,8 +5,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions.categorical import Categorical
 
+from src.action_utils import actions_to_env_numpy, sample_policy_actions
 from src.envs import EnvPool
 from src.models import ActorCritic, FeatureEncoder, Predictor, RecurrentActorCritic
 from src.utils import obs_to_tensor
@@ -190,6 +190,10 @@ def rollout(
     obs: np.ndarray,
     prev_action: torch.Tensor,
     traces: torch.Tensor,
+    action_mode: str = "discrete",
+    action_shape: tuple[int, ...] = (),
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
 ):
     n_envs = envs.num_envs
     M = traces.shape[1]
@@ -199,10 +203,13 @@ def rollout(
     alpha_const = alpha_base.expand(n_envs, -1).clamp(0.0, 1.0) if skip_drift else None
 
     obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
-    prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+    if str(action_mode) == "continuous":
+        prev_a_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+        act_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+    else:
+        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+        act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     trace_buf = torch.zeros((horizon, n_envs, M, d), device=device)
-
-    act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     logp_buf = torch.zeros((horizon, n_envs), device=device)
     val_buf = torch.zeros((horizon, n_envs), device=device)
     rew_buf = torch.zeros((horizon, n_envs), device=device)
@@ -225,16 +232,25 @@ def rollout(
         prev_a_buf[t] = prev_action
         trace_buf[t] = traces
 
-        logits, value = ac(obs_t, prev_action, traces.reshape(n_envs, -1))
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
+        policy_out, value = ac(obs_t, prev_action, traces.reshape(n_envs, -1))
+        action, logp, _entropy, _max_action_stat = sample_policy_actions(
+            policy_out=policy_out,
+            action_mode=action_mode,
+            deterministic=False,
+        )
 
         act_buf[t] = action
         logp_buf[t] = logp
         val_buf[t] = value
 
-        next_obs, reward, terminated, truncated, _ = envs.step(action.cpu().numpy())
+        env_action = actions_to_env_numpy(
+            actions=action,
+            action_mode=action_mode,
+            action_shape=action_shape,
+            action_low=action_low,
+            action_high=action_high,
+        )
+        next_obs, reward, terminated, truncated, _ = envs.step(env_action)
         done_env = terminated | truncated
 
         rew = torch.as_tensor(reward, device=device, dtype=torch.float32)
@@ -305,7 +321,7 @@ def rollout(
         obs = next_obs
 
     obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
-    logits_T, value_T = ac(obs_T, prev_action, traces.reshape(n_envs, -1))
+    _policy_out_T, value_T = ac(obs_T, prev_action, traces.reshape(n_envs, -1))
 
     batch = {
         "obs": obs_buf,
@@ -340,11 +356,19 @@ def rollout_recurrent(
     obs: np.ndarray,
     prev_action: torch.Tensor,
     hidden: tuple[torch.Tensor, torch.Tensor],
+    action_mode: str = "discrete",
+    action_shape: tuple[int, ...] = (),
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
 ):
     n_envs = envs.num_envs
     obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
-    prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+    if str(action_mode) == "continuous":
+        prev_a_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+        act_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+    else:
+        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+        act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     logp_buf = torch.zeros((horizon, n_envs), device=device)
     val_buf = torch.zeros((horizon, n_envs), device=device)
     rew_buf = torch.zeros((horizon, n_envs), device=device)
@@ -360,15 +384,24 @@ def rollout_recurrent(
         obs_buf[t] = obs_t
         prev_a_buf[t] = prev_action
 
-        logits, value, (h, c) = ac(obs_t, prev_action, (h, c))
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
+        policy_out, value, (h, c) = ac(obs_t, prev_action, (h, c))
+        action, logp, _entropy, _max_action_stat = sample_policy_actions(
+            policy_out=policy_out,
+            action_mode=action_mode,
+            deterministic=False,
+        )
         act_buf[t] = action
         logp_buf[t] = logp
         val_buf[t] = value
 
-        next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+        env_action = actions_to_env_numpy(
+            actions=action,
+            action_mode=action_mode,
+            action_shape=action_shape,
+            action_low=action_low,
+            action_high=action_high,
+        )
+        next_obs, reward, terminated, truncated, info = envs.step(env_action)
         done = terminated | truncated
 
         rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
@@ -401,14 +434,17 @@ def rollout_recurrent(
             done_idx = torch.as_tensor(done, device=device)
             h[:, done_idx] = 0.0
             c[:, done_idx] = 0.0
-            next_prev_action[done_idx] = 0
+            if str(action_mode) == "continuous":
+                next_prev_action[done_idx] = 0.0
+            else:
+                next_prev_action[done_idx] = 0
 
         prev_action = next_prev_action
         obs = next_obs
 
     obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
     # Bootstrap value at obs_T without advancing the carried recurrent state.
-    _, value_T, _ = ac(obs_T, prev_action, (h, c))
+    _policy_out_T, value_T, _ = ac(obs_T, prev_action, (h, c))
 
     batch = {
         "obs": obs_buf,

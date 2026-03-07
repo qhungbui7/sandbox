@@ -9,12 +9,16 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.distributions.categorical import Categorical
 from torch.optim.lr_scheduler import LambdaLR
 
 import gymnasium as gym
 import wandb
 
+from src.action_utils import (
+    actions_to_env_numpy,
+    init_prev_action,
+    sample_policy_actions,
+)
 from src.algorithms import (
     ALL_ALGOS,
     ON_POLICY_ALGOS,
@@ -762,6 +766,97 @@ def optimizer_param_stats(optimizer: torch.optim.Optimizer) -> dict:
     }
 
 
+def validate_encoder_optimization_path(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    device: str,
+) -> None:
+    """
+    Fail fast when encoder parameters are not trainable, missing from optimizer,
+    or disconnected from the loss graph.
+    """
+    model_base = getattr(model, "_orig_mod", model)
+    if not hasattr(model_base, "f_pol") or not hasattr(model_base.f_pol, "obs_encoder"):
+        return
+
+    encoder = model_base.f_pol.obs_encoder
+    encoder_params = list(encoder.parameters())
+    if not encoder_params:
+        raise RuntimeError("Encoder check failed: `ac.f_pol.obs_encoder` has no parameters.")
+
+    trainable = [p for p in encoder_params if p.requires_grad]
+    if not trainable:
+        raise RuntimeError("Encoder check failed: all encoder parameters have `requires_grad=False`.")
+
+    opt_param_ids = {id(p) for group in optimizer.param_groups for p in group.get("params", [])}
+    missing = [p for p in trainable if id(p) not in opt_param_ids]
+    if missing:
+        missing_elems = int(sum(p.numel() for p in missing))
+        raise RuntimeError(
+            "Encoder check failed: trainable encoder params are missing from optimizer "
+            f"({len(missing)} tensors, {missing_elems} parameters)."
+        )
+
+    encoder_type = str(getattr(model_base.f_pol, "encoder_type", "mlp")).lower()
+    if encoder_type == "cnn":
+        obs_shape = getattr(model_base.f_pol, "obs_shape", None)
+        if obs_shape is None:
+            raise RuntimeError("Encoder check failed: CNN encoder requires `obs_shape`.")
+        obs_probe = torch.zeros((2, *obs_shape), device=device, dtype=torch.float32)
+    else:
+        first = getattr(model_base.f_pol.obs_encoder, "net", [None])[0]
+        obs_dim = int(getattr(first, "in_features", 0))
+        if obs_dim <= 0:
+            raise RuntimeError("Encoder check failed: unable to infer MLP obs dim for probe forward pass.")
+        obs_probe = torch.zeros((2, obs_dim), device=device, dtype=torch.float32)
+
+    action_mode = str(getattr(model_base.f_pol, "action_type", "discrete"))
+    if action_mode == "continuous":
+        act_dim = int(getattr(model_base.f_pol, "act_dim", 0))
+        if act_dim <= 0:
+            raise RuntimeError("Encoder check failed: invalid continuous action dimension.")
+        prev_action_probe = torch.zeros((2, act_dim), device=device, dtype=torch.float32)
+    else:
+        prev_action_probe = torch.zeros(2, device=device, dtype=torch.int64)
+
+    optimizer.zero_grad(set_to_none=True)
+    was_training = model.training
+    model.train(True)
+    try:
+        if hasattr(model_base, "lstm"):
+            hidden_probe = model_base.init_hidden(2, device)
+            logits, values, _ = model(obs_probe, prev_action_probe, hidden_probe)
+        else:
+            core_in = int(model_base.core.net[0].in_features)
+            feat_out = int(model_base.f_pol.fuse.net[-1].out_features)
+            mem_dim = core_in - feat_out
+            if mem_dim < 0:
+                raise RuntimeError(
+                    "Encoder check failed: invalid `core` input size (cannot infer trace memory dimension)."
+                )
+            traces_probe = torch.zeros((2, mem_dim), device=device, dtype=torch.float32)
+            logits, values = model(obs_probe, prev_action_probe, traces_probe)
+
+        if (not logits.requires_grad) or (not values.requires_grad):
+            raise RuntimeError(
+                "Encoder check failed: policy/value outputs do not require gradients "
+                "(possible `detach()` or `torch.no_grad()` in forward path)."
+            )
+
+        probe_loss = logits.float().mean() + values.float().mean()
+        probe_loss.backward()
+        has_encoder_grad = any(param.grad is not None for param in trainable)
+        if not has_encoder_grad:
+            raise RuntimeError(
+                "Encoder check failed: encoder gradients are all `None` after backward "
+                "(graph likely detached from loss)."
+            )
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        model.train(was_training)
+
+
 def env_wrapper_chain(env: gym.Env, max_depth: int = 32) -> list[str]:
     chain = []
     current_env = env
@@ -1020,6 +1115,10 @@ def evaluate_trace_policy(
     ac: ActorCritic,
     f_mem: FeatureEncoder,
     predictor: Predictor | None,
+    action_mode: str,
+    action_shape: tuple[int, ...],
+    action_low: np.ndarray | None,
+    action_high: np.ndarray | None,
     alpha_base: torch.Tensor,
     alpha_max: torch.Tensor,
     device: str,
@@ -1053,12 +1152,25 @@ def evaluate_trace_policy(
                 carracing_downsample=int(getattr(args, "carracing_downsample", 1)),
                 carracing_grayscale=bool(getattr(args, "carracing_grayscale", False)),
                 frame_stack=int(getattr(args, "frame_stack", 1)),
+                carracing_action_mode=(
+                    "continuous"
+                    if (str(args.env_id).startswith("CarRacing") and action_mode == "continuous")
+                    else "discrete"
+                ),
             )
             for i in range(eval_num_envs)
         ]
         eval_envs = EnvPool(env_fns)
         obs, _ = eval_envs.reset(seed=eval_seed)
         n_envs = eval_envs.num_envs
+        act_dim = int(getattr(ac, "act_dim", 0))
+        if act_dim <= 0:
+            if action_mode == "continuous" and action_low is not None:
+                act_dim = int(np.asarray(action_low).reshape(-1).shape[0])
+            elif action_mode == "discrete" and isinstance(eval_envs.single_action_space, gym.spaces.Discrete):
+                act_dim = int(eval_envs.single_action_space.n)
+            else:
+                raise ValueError("Unable to infer action dimension for evaluation.")
 
         skip_drift = (args.reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
         alpha_const = alpha_base.expand(n_envs, -1).clamp(0.0, 1.0) if skip_drift else None
@@ -1079,7 +1191,7 @@ def evaluate_trace_policy(
                 device=device,
             )
 
-        prev_action = torch.zeros(n_envs, device=device, dtype=torch.int64)
+        prev_action = init_prev_action(num_envs=n_envs, action_mode=action_mode, act_dim=act_dim, device=device)
         obs0_t = obs_to_tensor(obs, device=device, obs_normalization=args.obs_normalization)
         x_mem0 = encode_mem(f_mem, obs0_t, prev_action)
 
@@ -1099,13 +1211,20 @@ def evaluate_trace_policy(
             obs_t = obs_to_tensor(obs, device=device, obs_normalization=args.obs_normalization)
             traces_flat = traces.reshape(n_envs, -1)
 
-            out, value = ac(obs_t, prev_action, traces_flat)
-            if args.algo == "dqn" or deterministic:
-                action = out.argmax(dim=-1)
-            else:
-                action = Categorical(logits=out).sample()
-
-            next_obs, reward, terminated, truncated, _ = eval_envs.step(action.cpu().numpy())
+            policy_out, value = ac(obs_t, prev_action, traces_flat)
+            action, _logp, _entropy, _max_action_stat = sample_policy_actions(
+                policy_out=policy_out,
+                action_mode=action_mode,
+                deterministic=bool(args.algo == "dqn" or deterministic),
+            )
+            env_action = actions_to_env_numpy(
+                actions=action,
+                action_mode=action_mode,
+                action_shape=action_shape,
+                action_low=action_low,
+                action_high=action_high,
+            )
+            next_obs, reward, terminated, truncated, _ = eval_envs.step(env_action)
             done_env = terminated | truncated
 
             rew = torch.as_tensor(reward, device=device, dtype=torch.float32)
@@ -1115,7 +1234,10 @@ def evaluate_trace_policy(
             next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=args.obs_normalization)
             next_prev_action = action.clone()
             if done.any():
-                next_prev_action[done] = 0
+                if action_mode == "continuous":
+                    next_prev_action[done] = 0.0
+                else:
+                    next_prev_action[done] = 0
             x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
 
             if skip_drift:
@@ -1206,6 +1328,10 @@ def evaluate_recurrent_policy(
     args,
     mask_indices: list[int],
     ac: RecurrentActorCritic,
+    action_mode: str,
+    action_shape: tuple[int, ...],
+    action_low: np.ndarray | None,
+    action_high: np.ndarray | None,
     device: str,
     eval_seed: int,
     eval_num_envs: int,
@@ -1232,34 +1358,57 @@ def evaluate_recurrent_policy(
                 carracing_downsample=int(getattr(args, "carracing_downsample", 1)),
                 carracing_grayscale=bool(getattr(args, "carracing_grayscale", False)),
                 frame_stack=int(getattr(args, "frame_stack", 1)),
+                carracing_action_mode=(
+                    "continuous"
+                    if (str(args.env_id).startswith("CarRacing") and action_mode == "continuous")
+                    else "discrete"
+                ),
             )
             for i in range(eval_num_envs)
         ]
         eval_envs = EnvPool(env_fns)
         obs, _ = eval_envs.reset(seed=eval_seed)
         n_envs = eval_envs.num_envs
+        act_dim = int(getattr(ac, "act_dim", 0))
+        if act_dim <= 0:
+            if action_mode == "continuous" and action_low is not None:
+                act_dim = int(np.asarray(action_low).reshape(-1).shape[0])
+            elif action_mode == "discrete" and isinstance(eval_envs.single_action_space, gym.spaces.Discrete):
+                act_dim = int(eval_envs.single_action_space.n)
+            else:
+                raise ValueError("Unable to infer action dimension for evaluation.")
 
-        prev_action = torch.zeros(n_envs, device=device, dtype=torch.int64)
+        prev_action = init_prev_action(num_envs=n_envs, action_mode=action_mode, act_dim=act_dim, device=device)
         h, c = ac.init_hidden(n_envs, device)
 
         step_calls = 0
         max_steps = int(max(eval_episodes, 1) * 10_000)
         while (len(eval_envs.episode_returns) < eval_episodes) and (step_calls < max_steps):
             obs_t = obs_to_tensor(obs, device=device, obs_normalization=args.obs_normalization)
-            logits, _value, (h, c) = ac(obs_t, prev_action, (h, c))
-            if deterministic:
-                action = logits.argmax(dim=-1)
-            else:
-                action = Categorical(logits=logits).sample()
-
-            next_obs, reward, terminated, truncated, _ = eval_envs.step(action.cpu().numpy())
+            policy_out, _value, (h, c) = ac(obs_t, prev_action, (h, c))
+            action, _logp, _entropy, _max_action_stat = sample_policy_actions(
+                policy_out=policy_out,
+                action_mode=action_mode,
+                deterministic=bool(deterministic),
+            )
+            env_action = actions_to_env_numpy(
+                actions=action,
+                action_mode=action_mode,
+                action_shape=action_shape,
+                action_low=action_low,
+                action_high=action_high,
+            )
+            next_obs, reward, terminated, truncated, _ = eval_envs.step(env_action)
             done_env = terminated | truncated
             done = torch.as_tensor(done_env, device=device, dtype=torch.bool)
             next_prev_action = action.clone()
             if done.any():
                 h[:, done] = 0.0
                 c[:, done] = 0.0
-                next_prev_action[done] = 0
+                if action_mode == "continuous":
+                    next_prev_action[done] = 0.0
+                else:
+                    next_prev_action[done] = 0
 
             prev_action = next_prev_action
             obs = next_obs
@@ -1310,6 +1459,10 @@ def train_recurrent(
     obs_dim: int,
     obs_shape: tuple[int, ...],
     act_dim: int,
+    action_mode: str,
+    action_shape: tuple[int, ...],
+    action_low: np.ndarray | None,
+    action_high: np.ndarray | None,
     device: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
@@ -1331,6 +1484,7 @@ def train_recurrent(
         feat_dim=args.feat_dim,
         encoder_type=args.encoder,
         obs_shape=obs_shape,
+        action_type=action_mode,
     ).to(device)
     ac = maybe_compile_module(ac, enabled=bool(args.compile), mode=str(args.compile_mode))
     opt = make_adam_optimizer(
@@ -1340,6 +1494,7 @@ def train_recurrent(
         adam_foreach=args.adam_foreach,
         adam_fused=args.adam_fused,
     )
+    validate_encoder_optimization_path(ac, opt, device=device)
     updates = args.total_steps // (args.num_envs * args.horizon)
     lr_scheduler = make_lr_scheduler(
         opt,
@@ -1379,7 +1534,7 @@ def train_recurrent(
     rng = torch.Generator(device=device)
     rng.manual_seed(args.seed)
 
-    prev_action = torch.zeros(args.num_envs, device=device, dtype=torch.int64)
+    prev_action = init_prev_action(num_envs=args.num_envs, action_mode=action_mode, act_dim=act_dim, device=device)
     hidden = ac.init_hidden(args.num_envs, device)
     obs = obs0
 
@@ -1432,6 +1587,10 @@ def train_recurrent(
                 obs=obs,
                 prev_action=prev_action,
                 hidden=hidden,
+                action_mode=action_mode,
+                action_shape=action_shape,
+                action_low=action_low,
+                action_high=action_high,
             )
             ended_episodes = envs.episode_returns[episodes_before:] if debug_ppo else []
             ppo_debug_cfg = None
@@ -1439,7 +1598,7 @@ def train_recurrent(
                 ppo_debug_cfg = {
                     "seed": int(args.seed),
                     "update_idx": int(upd + 1),
-                    "action_bins": int(act_dim),
+                    "action_bins": int(act_dim) if action_mode == "discrete" else 0,
                     "ratio_sample_size": 4096,
                     "frame_delta_pairs": 128,
                 }
@@ -1499,6 +1658,10 @@ def train_recurrent(
                     args=args,
                     mask_indices=mask_indices,
                     ac=ac,
+                    action_mode=action_mode,
+                    action_shape=action_shape,
+                    action_low=action_low,
+                    action_high=action_high,
                     device=device,
                     eval_seed=eval_seed,
                     eval_num_envs=eval_num_envs,
@@ -1580,11 +1743,15 @@ def make_env_fn(
     carracing_downsample: int = 1,
     carracing_grayscale: bool = False,
     frame_stack: int = 1,
+    carracing_action_mode: str = "discrete",
 ):
     def _thunk():
         env = gym.make(env_id)
         if env_id.startswith("CarRacing"):
-            env = DiscreteCarRacingWrapper(env)
+            if carracing_action_mode == "discrete":
+                env = DiscreteCarRacingWrapper(env)
+            elif carracing_action_mode != "continuous":
+                raise ValueError(f"Unsupported carracing_action_mode: {carracing_action_mode}")
             if (carracing_downsample > 1) or carracing_grayscale:
                 env = CarRacingPreprocessWrapper(
                     env,
@@ -1648,6 +1815,16 @@ def main():
         type=int,
         default=1,
         help="Stack the last K observations along the last axis (recommended with --encoder cnn).",
+    )
+    p.add_argument(
+        "--action-space",
+        type=str,
+        default="auto",
+        choices=["auto", "discrete", "continuous"],
+        help=(
+            "Action parameterization mode. `auto` keeps current defaults "
+            "(CarRacing -> discrete wrapper, other envs use native action space)."
+        ),
     )
 
     p.add_argument("--hidden-dim", type=int, default=128)
@@ -2033,6 +2210,15 @@ def main():
             f"for full-training runs (remainder={remainder})."
         )
 
+    carracing_action_mode = "discrete"
+    if str(args.env_id).startswith("CarRacing"):
+        if str(args.action_space) == "continuous":
+            carracing_action_mode = "continuous"
+        elif str(args.action_space) in {"auto", "discrete"}:
+            carracing_action_mode = "discrete"
+        else:
+            raise ValueError(f"Unsupported --action-space `{args.action_space}`.")
+
     env_fns = [
         make_env_fn(
             env_id=args.env_id,
@@ -2045,6 +2231,7 @@ def main():
             carracing_downsample=int(args.carracing_downsample),
             carracing_grayscale=bool(args.carracing_grayscale),
             frame_stack=int(args.frame_stack),
+            carracing_action_mode=carracing_action_mode,
         )
         for i in range(args.num_envs)
     ]
@@ -2053,14 +2240,36 @@ def main():
     obs0, _ = envs.reset(seed=args.seed)
     if not isinstance(envs.single_observation_space, gym.spaces.Box):
         raise TypeError(f"Expected Box observation space, got {type(envs.single_observation_space)}")
-    if not isinstance(envs.single_action_space, gym.spaces.Discrete):
-        raise TypeError(
-            "Only Discrete action spaces are supported in this trainer. "
-            "For CarRacing, use `env_id=CarRacing-v3` (auto-discretized)."
+
+    if isinstance(envs.single_action_space, gym.spaces.Discrete):
+        resolved_action_mode = "discrete"
+        action_shape: tuple[int, ...] = ()
+        act_dim = int(envs.single_action_space.n)
+        action_low = None
+        action_high = None
+    elif isinstance(envs.single_action_space, gym.spaces.Box):
+        resolved_action_mode = "continuous"
+        action_shape = tuple(int(x) for x in envs.single_action_space.shape)
+        act_dim = int(np.prod(action_shape))
+        action_low = np.asarray(envs.single_action_space.low, dtype=np.float32).reshape(-1)
+        action_high = np.asarray(envs.single_action_space.high, dtype=np.float32).reshape(-1)
+    else:
+        raise TypeError(f"Unsupported action space type: {type(envs.single_action_space)}")
+
+    if (str(args.action_space) != "auto") and (str(args.action_space) != resolved_action_mode):
+        raise ValueError(
+            f"--action-space={args.action_space} does not match resolved env action space ({resolved_action_mode})."
         )
+    if args.algo == "dqn" and resolved_action_mode != "discrete":
+        raise ValueError("`--algo dqn` requires a discrete action space.")
+    if resolved_action_mode == "continuous" and args.algo != "ppo":
+        raise ValueError(
+            "Continuous action space is currently supported with `--algo ppo` only."
+        )
+    args.resolved_action_mode = resolved_action_mode
+    args.resolved_action_shape = list(action_shape)
 
     obs_dim = int(np.prod(envs.single_observation_space.shape))
-    act_dim = int(envs.single_action_space.n)
     feat_dim = args.feat_dim
     mem_dim = M * feat_dim
 
@@ -2100,6 +2309,8 @@ def main():
                 "observation_dtype": str(getattr(envs.single_observation_space, "dtype", None)),
                 "obs_normalization": str(args.obs_normalization),
                 "action_space": str(envs.single_action_space),
+                "action_mode": resolved_action_mode,
+                "action_shape": list(action_shape),
                 "wrappers": env_wrapper_chain(env0),
                 "mask_indices": mask_indices,
                 "benchmark": benchmark,
@@ -2127,6 +2338,7 @@ def main():
                 "policy": args.policy,
                 "algorithm": args.algo,
                 "encoder": args.encoder,
+                "action_mode": resolved_action_mode,
                 "hidden_dim": args.hidden_dim,
                 "feat_dim": args.feat_dim,
                 "act_embed_dim": args.act_embed_dim,
@@ -2143,6 +2355,10 @@ def main():
             obs_dim=obs_dim,
             obs_shape=tuple(envs.single_observation_space.shape),
             act_dim=act_dim,
+            action_mode=resolved_action_mode,
+            action_shape=action_shape,
+            action_low=action_low,
+            action_high=action_high,
             device=device,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
@@ -2166,6 +2382,7 @@ def main():
         mem_dim=mem_dim,
         encoder_type=args.encoder,
         obs_shape=tuple(envs.single_observation_space.shape),
+        action_type=resolved_action_mode,
     ).to(device)
 
     f_mem = FeatureEncoder(
@@ -2176,12 +2393,18 @@ def main():
         feat_dim=feat_dim,
         encoder_type=args.encoder,
         obs_shape=tuple(envs.single_observation_space.shape),
+        action_type=resolved_action_mode,
     ).to(device)
     f_mem.load_state_dict(ac.f_pol.state_dict())
 
     predictor = None
     if (args.lambda_pred > 0.0) or (args.pred_coef > 0.0):
-        predictor = Predictor(feat_dim=feat_dim, act_dim=act_dim, hidden_dim=args.hidden_dim).to(device)
+        predictor = Predictor(
+            feat_dim=feat_dim,
+            act_dim=act_dim,
+            hidden_dim=args.hidden_dim,
+            action_type=resolved_action_mode,
+        ).to(device)
 
     ac = maybe_compile_module(ac, enabled=bool(args.compile), mode=str(args.compile_mode))
     f_mem = maybe_compile_module(f_mem, enabled=bool(args.compile), mode=str(args.compile_mode))
@@ -2192,7 +2415,7 @@ def main():
     alpha_max = torch.tensor(alpha_max_list, device=device, dtype=torch.float32).unsqueeze(0)
 
     traces = torch.zeros((args.num_envs, M, feat_dim), device=device)
-    prev_action = torch.zeros(args.num_envs, device=device, dtype=torch.int64)
+    prev_action = init_prev_action(num_envs=args.num_envs, action_mode=resolved_action_mode, act_dim=act_dim, device=device)
 
     with torch.no_grad():
         obs0_t = obs_to_tensor(obs0, device=device, obs_normalization=args.obs_normalization)
@@ -2227,6 +2450,7 @@ def main():
         adam_foreach=args.adam_foreach,
         adam_fused=args.adam_fused,
     )
+    validate_encoder_optimization_path(ac, opt, device=device)
     updates = args.total_steps // (args.num_envs * args.horizon)
     lr_scheduler = make_lr_scheduler(
         opt,
@@ -2314,6 +2538,7 @@ def main():
             mem_dim=mem_dim,
             encoder_type=args.encoder,
             obs_shape=tuple(envs.single_observation_space.shape),
+            action_type=resolved_action_mode,
         ).to(device)
         hard_update_(dqn_target_ac, ac)
         dqn_target_ac = maybe_compile_module(dqn_target_ac, enabled=bool(args.compile), mode=str(args.compile_mode))
@@ -2389,6 +2614,10 @@ def main():
                     obs=obs,
                     prev_action=prev_action,
                     traces=traces,
+                    action_mode=resolved_action_mode,
+                    action_shape=action_shape,
+                    action_low=action_low,
+                    action_high=action_high,
                 )
                 ended_episodes = envs.episode_returns[episodes_before:] if debug_ppo else []
                 ppo_debug_cfg = None
@@ -2396,7 +2625,7 @@ def main():
                     ppo_debug_cfg = {
                         "seed": int(args.seed),
                         "update_idx": int(upd + 1),
-                        "action_bins": int(act_dim),
+                        "action_bins": int(act_dim) if resolved_action_mode == "discrete" else 0,
                         "ratio_sample_size": 4096,
                         "frame_delta_pairs": 128,
                     }
@@ -2474,6 +2703,10 @@ def main():
                         ac=ac,
                         f_mem=f_mem,
                         predictor=predictor,
+                        action_mode=resolved_action_mode,
+                        action_shape=action_shape,
+                        action_low=action_low,
+                        action_high=action_high,
                         alpha_base=alpha_base,
                         alpha_max=alpha_max,
                         device=device,
@@ -2614,6 +2847,10 @@ def main():
                         ac=ac,
                         f_mem=f_mem,
                         predictor=predictor,
+                        action_mode=resolved_action_mode,
+                        action_shape=action_shape,
+                        action_low=action_low,
+                        action_high=action_high,
                         alpha_base=alpha_base,
                         alpha_max=alpha_max,
                         device=device,

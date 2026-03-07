@@ -56,6 +56,60 @@ def test_resolve_device_override():
     assert resolve_device("cpu", None) == "cpu"
 
 
+def test_validate_encoder_optimization_path_passes():
+    ac = ActorCritic(
+        obs_dim=4,
+        act_dim=2,
+        act_embed_dim=8,
+        hidden_dim=16,
+        feat_dim=8,
+        mem_dim=16,
+    ).to("cpu")
+    opt = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    amg.validate_encoder_optimization_path(ac, opt, device="cpu")
+
+
+def test_validate_encoder_optimization_path_fails_when_encoder_missing_from_optimizer():
+    ac = ActorCritic(
+        obs_dim=4,
+        act_dim=2,
+        act_embed_dim=8,
+        hidden_dim=16,
+        feat_dim=8,
+        mem_dim=16,
+    ).to("cpu")
+    params = list(ac.core.parameters()) + list(ac.pi.parameters()) + list(ac.v.parameters())
+    opt = torch.optim.Adam(params, lr=1e-3)
+
+    try:
+        amg.validate_encoder_optimization_path(ac, opt, device="cpu")
+    except RuntimeError as exc:
+        assert "missing from optimizer" in str(exc)
+    else:
+        raise AssertionError("Expected optimizer-missing encoder parameters to fail validation.")
+
+
+def test_validate_encoder_optimization_path_fails_when_requires_grad_disabled():
+    ac = ActorCritic(
+        obs_dim=4,
+        act_dim=2,
+        act_embed_dim=8,
+        hidden_dim=16,
+        feat_dim=8,
+        mem_dim=16,
+    ).to("cpu")
+    for param in ac.f_pol.obs_encoder.parameters():
+        param.requires_grad_(False)
+    opt = torch.optim.Adam(ac.parameters(), lr=1e-3)
+
+    try:
+        amg.validate_encoder_optimization_path(ac, opt, device="cpu")
+    except RuntimeError as exc:
+        assert "requires_grad=False" in str(exc)
+    else:
+        raise AssertionError("Expected requires_grad-disabled encoder parameters to fail validation.")
+
+
 def test_init_wandb_includes_source_config_and_uploads_file(tmp_path, monkeypatch):
     cfg_path = tmp_path / "unit_config.yaml"
     cfg_path.write_text("seed: 7\nenv_id: CartPole-v1\n")

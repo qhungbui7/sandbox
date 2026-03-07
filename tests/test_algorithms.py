@@ -33,6 +33,36 @@ class DummyDrift:
         return
 
 
+class ContinuousLineEnv:
+    def __init__(self):
+        self.action_space = gym.spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            shape=(2,),
+            dtype=np.float32,
+        )
+        self.observation_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(4,), dtype=np.float32)
+        self._state = np.zeros((4,), dtype=np.float32)
+        self._t = 0
+
+    def reset(self, seed=None, options=None):
+        self._state[:] = 0.0
+        self._t = 0
+        return self._state.copy(), {}
+
+    def step(self, action):
+        a = np.asarray(action, dtype=np.float32)
+        a = np.clip(a, self.action_space.low, self.action_space.high)
+        self._state[:2] = np.clip(self._state[:2] + a, -10.0, 10.0)
+        self._state[2] = float(self._t % 5)
+        self._state[3] = float(np.linalg.norm(a))
+        reward = float(-np.square(a).sum())
+        self._t += 1
+        terminated = bool(self._t >= 12)
+        truncated = False
+        return self._state.copy(), reward, terminated, truncated, {}
+
+
 def _build_envs(num_envs: int, seed: int = 0):
     env_fns = [
         make_env_fn(
@@ -418,3 +448,116 @@ def test_on_policy_gae_uses_dones_not_terminated(monkeypatch):
         )
 
     assert calls["count"] == 4
+
+
+def test_envpool_step_supports_continuous_actions():
+    envs = EnvPool([ContinuousLineEnv, ContinuousLineEnv])
+    obs0, _ = envs.reset(seed=0)
+    assert obs0.shape == (2, 4)
+    actions = np.asarray([[0.25, -0.5], [-0.75, 0.1]], dtype=np.float32)
+    obs1, rew, term, trunc, _info = envs.step(actions)
+    assert obs1.shape == (2, 4)
+    assert rew.shape == (2,)
+    assert term.shape == (2,)
+    assert trunc.shape == (2,)
+
+
+def test_ppo_update_supports_continuous_actions_cpu():
+    set_seed(7)
+    device = "cpu"
+    envs = EnvPool([ContinuousLineEnv, ContinuousLineEnv])
+    obs0, _ = envs.reset(seed=7)
+
+    obs_dim = int(np.prod(envs.single_observation_space.shape))
+    act_dim = int(np.prod(envs.single_action_space.shape))
+    feat_dim = 16
+    hidden_dim = 32
+    M = 2
+    mem_dim = M * feat_dim
+
+    ac = ActorCritic(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        mem_dim=mem_dim,
+        action_type="continuous",
+    ).to(device)
+    f_mem = FeatureEncoder(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        act_embed_dim=8,
+        hidden_dim=hidden_dim,
+        feat_dim=feat_dim,
+        action_type="continuous",
+    ).to(device)
+    f_mem.load_state_dict(ac.f_pol.state_dict())
+    alpha_base = torch.tensor([0.5, 0.1], device=device).unsqueeze(0)
+    alpha_max = torch.tensor([0.8, 0.3], device=device).unsqueeze(0)
+    traces = torch.zeros((envs.num_envs, M, feat_dim), device=device)
+    prev_action = torch.zeros((envs.num_envs, act_dim), device=device, dtype=torch.float32)
+    obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
+    traces = trace_update(traces, f_mem(obs0_t, prev_action), alpha_base.expand(envs.num_envs, -1))
+    drift = DummyDrift(device=device)
+
+    batch, _, _, _ = rollout(
+        envs=envs,
+        ac=ac,
+        f_mem=f_mem,
+        drift=drift,
+        predictor=None,
+        device=device,
+        horizon=8,
+        gamma=0.99,
+        lambda_pred=0.0,
+        obs_normalization="none",
+        alpha_base=alpha_base,
+        alpha_max=alpha_max,
+        reset_strategy="none",
+        reset_long_fraction=0.5,
+        obs=obs0,
+        prev_action=prev_action,
+        traces=traces,
+        action_mode="continuous",
+        action_shape=tuple(envs.single_action_space.shape),
+        action_low=np.asarray(envs.single_action_space.low, dtype=np.float32).reshape(-1),
+        action_high=np.asarray(envs.single_action_space.high, dtype=np.float32).reshape(-1),
+    )
+
+    stats = update_on_policy(
+        algo="ppo",
+        ac=ac,
+        opt=torch.optim.Adam(ac.parameters(), lr=1e-3),
+        batch=batch,
+        clip_coef=0.2,
+        vf_clip=True,
+        target_kl=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        ent_coef=0.01,
+        epochs=1,
+        minibatch_size=4,
+        lam=0.95,
+        gamma=0.99,
+        pred=None,
+        pred_coef=0.0,
+        generator=torch.Generator(device=device).manual_seed(7),
+        device=device,
+        use_amp=False,
+        amp_dtype=torch.float16,
+        grad_scaler=None,
+        trpo_max_kl=0.01,
+        trpo_backtrack_coef=0.5,
+        trpo_backtrack_iters=5,
+        trpo_value_epochs=1,
+        vtrace_rho_clip=1.0,
+        vtrace_c_clip=1.0,
+        vmpo_topk_frac=0.5,
+        vmpo_eta=1.0,
+        vmpo_kl_coef=1.0,
+        vmpo_kl_target=0.01,
+    )
+    for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
+        assert key in stats
+        assert torch.isfinite(torch.tensor(stats[key]))

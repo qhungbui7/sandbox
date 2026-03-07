@@ -92,6 +92,7 @@ export REPORT_DIR=reports/benchmarks
 | `--config` / `<config.yaml>` | YAML file to override defaults (flag or positional). CLI flags still win. |
 | `--policy` | `amt` (default), `recurrent` (LSTM core), or `ff` (feed-forward proxy). |
 | `--algo` | `ppo` (default), `a2c`, `trpo`, `reinforce`, `v-trace`, `v-mpo`, `dqn`. |
+| `--action-space` | Action mode: `auto`, `discrete`, or `continuous` (`continuous` currently supports PPO paths). |
 | `--carracing-downsample`, `--carracing-grayscale` | Optional CarRacing observation preprocessing to reduce input size. |
 | `--frame-stack` | Stack last K observations along channel/last axis (recommended with `--encoder cnn`). |
 | `--debug-log` | Enable extra per-update PPO debug diagnostics in `metrics.jsonl`/W&B. |

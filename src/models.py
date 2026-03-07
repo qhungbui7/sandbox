@@ -64,11 +64,21 @@ class FeatureEncoder(nn.Module):
         *,
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
+        action_type: str = "discrete",
     ):
         super().__init__()
         self.encoder_type = str(encoder_type)
         self.obs_shape = tuple(obs_shape) if obs_shape is not None else None
-        self.act_emb = nn.Embedding(act_dim, act_embed_dim)
+        self.action_type = str(action_type)
+        self.act_dim = int(act_dim)
+        if self.action_type == "discrete":
+            self.act_emb = nn.Embedding(act_dim, act_embed_dim)
+            self.act_proj = None
+        elif self.action_type == "continuous":
+            self.act_emb = None
+            self.act_proj = MLP(self.act_dim, hidden_dim, act_embed_dim, activation=nn.Tanh)
+        else:
+            raise ValueError(f"Unsupported action_type: {self.action_type}")
         if self.encoder_type == "mlp":
             self.obs_encoder = MLP(obs_dim, hidden_dim, feat_dim, activation=nn.Tanh)
         elif self.encoder_type == "cnn":
@@ -84,7 +94,15 @@ class FeatureEncoder(nn.Module):
         if self.encoder_type == "mlp" and obs.ndim > 2:
             obs = obs.reshape(obs.shape[0], -1)
         x_obs = self.obs_encoder(obs)
-        a = self.act_emb(prev_action.long())
+        if self.action_type == "discrete":
+            a = self.act_emb(prev_action.long())
+        else:
+            a_in = prev_action.float()
+            if a_in.ndim > 2:
+                a_in = a_in.reshape(a_in.shape[0], -1)
+            elif a_in.ndim == 1:
+                a_in = a_in.reshape(a_in.shape[0], 1)
+            a = self.act_proj(a_in)
         x = torch.cat([x_obs, a], dim=-1)
         return self.fuse(x)
 
@@ -101,8 +119,11 @@ class ActorCritic(nn.Module):
         *,
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
+        action_type: str = "discrete",
     ):
         super().__init__()
+        self.action_type = str(action_type)
+        self.act_dim = int(act_dim)
         self.f_pol = FeatureEncoder(
             obs_dim,
             act_dim,
@@ -111,9 +132,16 @@ class ActorCritic(nn.Module):
             feat_dim,
             encoder_type=encoder_type,
             obs_shape=obs_shape,
+            action_type=self.action_type,
         )
         self.core = MLP(feat_dim + mem_dim, hidden_dim, hidden_dim, activation=nn.Tanh)
-        self.pi = nn.Linear(hidden_dim, act_dim)
+        if self.action_type == "discrete":
+            self.pi = nn.Linear(hidden_dim, act_dim)
+        elif self.action_type == "continuous":
+            self.pi_mean = nn.Linear(hidden_dim, act_dim)
+            self.pi_log_std = nn.Parameter(torch.zeros(act_dim))
+        else:
+            raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)
 
     def forward(
@@ -121,19 +149,41 @@ class ActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x_pol = self.f_pol(obs, prev_action)
         h = self.core(torch.cat([x_pol, traces_flat], dim=-1))
-        logits = self.pi(h)
+        if self.action_type == "discrete":
+            logits = self.pi(h)
+        else:
+            mean = self.pi_mean(h)
+            log_std = self.pi_log_std.expand_as(mean)
+            logits = torch.cat([mean, log_std], dim=-1)
         value = self.v(h).squeeze(-1)
         return logits, value
 
 
 class Predictor(nn.Module):
-    def __init__(self, feat_dim: int, act_dim: int, hidden_dim: int):
+    def __init__(self, feat_dim: int, act_dim: int, hidden_dim: int, *, action_type: str = "discrete"):
         super().__init__()
-        self.act_emb = nn.Embedding(act_dim, hidden_dim)
+        self.action_type = str(action_type)
+        self.act_dim = int(act_dim)
+        if self.action_type == "discrete":
+            self.act_emb = nn.Embedding(act_dim, hidden_dim)
+            self.act_proj = None
+        elif self.action_type == "continuous":
+            self.act_emb = None
+            self.act_proj = MLP(self.act_dim, hidden_dim, hidden_dim, activation=nn.Tanh)
+        else:
+            raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.net = MLP(feat_dim + hidden_dim, hidden_dim, feat_dim, activation=nn.Tanh)
 
     def forward(self, x_mem: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        a = self.act_emb(action.long())
+        if self.action_type == "discrete":
+            a = self.act_emb(action.long())
+        else:
+            a_in = action.float()
+            if a_in.ndim > 2:
+                a_in = a_in.reshape(a_in.shape[0], -1)
+            elif a_in.ndim == 1:
+                a_in = a_in.reshape(a_in.shape[0], 1)
+            a = self.act_proj(a_in)
         return self.net(torch.cat([x_mem, a], dim=-1))
 
 
@@ -150,8 +200,11 @@ class RecurrentActorCritic(nn.Module):
         *,
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
+        action_type: str = "discrete",
     ):
         super().__init__()
+        self.action_type = str(action_type)
+        self.act_dim = int(act_dim)
         self.f_pol = FeatureEncoder(
             obs_dim,
             act_dim,
@@ -160,9 +213,16 @@ class RecurrentActorCritic(nn.Module):
             feat_dim,
             encoder_type=encoder_type,
             obs_shape=obs_shape,
+            action_type=self.action_type,
         )
         self.lstm = nn.LSTM(input_size=feat_dim, hidden_size=hidden_dim, num_layers=1)
-        self.pi = nn.Linear(hidden_dim, act_dim)
+        if self.action_type == "discrete":
+            self.pi = nn.Linear(hidden_dim, act_dim)
+        elif self.action_type == "continuous":
+            self.pi_mean = nn.Linear(hidden_dim, act_dim)
+            self.pi_log_std = nn.Parameter(torch.zeros(act_dim))
+        else:
+            raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)
 
     def init_hidden(self, batch_size: int, device: str):
@@ -177,6 +237,11 @@ class RecurrentActorCritic(nn.Module):
         x = x.unsqueeze(0)  # [1, B, feat]
         out, (h, c) = self.lstm(x, hidden)
         out = out.squeeze(0)
-        logits = self.pi(out)
+        if self.action_type == "discrete":
+            logits = self.pi(out)
+        else:
+            mean = self.pi_mean(out)
+            log_std = self.pi_log_std.expand_as(mean)
+            logits = torch.cat([mean, log_std], dim=-1)
         value = self.v(out).squeeze(-1)
         return logits, value, (h, c)
