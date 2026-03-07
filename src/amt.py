@@ -152,7 +152,7 @@ def apply_reset(z: torch.Tensor, x_next: torch.Tensor, strategy: str, long_mask:
     raise ValueError(f"Unknown reset strategy: {strategy}")
 
 
-def encode_mem(f_mem: FeatureEncoder, obs: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
+def encode_mem(f_mem: FeatureEncoder, obs: torch.Tensor, prev_action: torch.Tensor | None) -> torch.Tensor:
     x_mem = f_mem(obs, prev_action)
     return F.layer_norm(x_mem, (x_mem.shape[-1],))
 
@@ -175,7 +175,7 @@ def maybe_reset_traces(
 def rollout(
     envs: EnvPool,
     ac: ActorCritic,
-    f_mem: FeatureEncoder,
+    f_mem: FeatureEncoder | None,
     drift: DriftMonitor | None,
     predictor: Predictor | None,
     device: str,
@@ -188,28 +188,56 @@ def rollout(
     reset_strategy: str,
     reset_long_fraction: float,
     obs: np.ndarray,
-    prev_action: torch.Tensor,
-    traces: torch.Tensor,
+    prev_action: torch.Tensor | None,
+    traces: torch.Tensor | None,
     action_mode: str = "discrete",
     action_shape: tuple[int, ...] = (),
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
 ):
     n_envs = envs.num_envs
-    M = traces.shape[1]
-    d = traces.shape[2]
+    use_traces = bool(getattr(ac, "use_traces", True))
+    use_prev_action = bool(getattr(getattr(ac, "f_pol", None), "use_prev_action", True))
+    if use_traces:
+        if f_mem is None:
+            raise RuntimeError("f_mem is required when use_traces=True.")
+        if traces is None:
+            raise RuntimeError("traces is required when use_traces=True.")
+    if not use_prev_action:
+        prev_action = None
 
-    skip_drift = (reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
-    alpha_const = alpha_base.expand(n_envs, -1).clamp(0.0, 1.0) if skip_drift else None
+    if use_traces:
+        M = traces.shape[1]
+        d = traces.shape[2]
+        skip_drift = (reset_strategy == "none") and torch.allclose(alpha_base, alpha_max)
+        alpha_const = alpha_base.expand(n_envs, -1).clamp(0.0, 1.0) if skip_drift else None
+        trace_buf = torch.zeros((horizon, n_envs, M, d), device=device)
+        xmem_buf = torch.zeros((horizon, n_envs, d), device=device)
+        xmem_next_buf = torch.zeros((horizon, n_envs, d), device=device)
+        long_start = int(math.floor((1.0 - reset_long_fraction) * M))
+        long_mask = torch.zeros(M, device=device, dtype=torch.bool)
+        if reset_strategy == "partial":
+            long_mask[long_start:] = True
+    else:
+        skip_drift = True
+        alpha_const = None
+        trace_buf = None
+        xmem_buf = None
+        xmem_next_buf = None
+        long_mask = None
 
     obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
     if str(action_mode) == "continuous":
-        prev_a_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
-        act_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+        act_dim = int(prev_action.shape[-1]) if prev_action is not None else int(np.prod(action_shape))
+        prev_a_buf = (
+            torch.zeros((horizon, n_envs, act_dim), device=device, dtype=torch.float32)
+            if use_prev_action
+            else None
+        )
+        act_buf = torch.zeros((horizon, n_envs, act_dim), device=device, dtype=torch.float32)
     else:
-        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64) if use_prev_action else None
         act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
-    trace_buf = torch.zeros((horizon, n_envs, M, d), device=device)
     logp_buf = torch.zeros((horizon, n_envs), device=device)
     val_buf = torch.zeros((horizon, n_envs), device=device)
     rew_buf = torch.zeros((horizon, n_envs), device=device)
@@ -218,21 +246,16 @@ def rollout(
     trunc_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
     reset_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
 
-    xmem_buf = torch.zeros((horizon, n_envs, d), device=device)
-    xmem_next_buf = torch.zeros((horizon, n_envs, d), device=device)
-
-    long_start = int(math.floor((1.0 - reset_long_fraction) * M))
-    long_mask = torch.zeros(M, device=device, dtype=torch.bool)
-    if reset_strategy == "partial":
-        long_mask[long_start:] = True
-
     for t in range(horizon):
         obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
-        prev_a_buf[t] = prev_action
-        trace_buf[t] = traces
+        if prev_a_buf is not None and prev_action is not None:
+            prev_a_buf[t] = prev_action
+        if trace_buf is not None and traces is not None:
+            trace_buf[t] = traces
 
-        policy_out, value = ac(obs_t, prev_action, traces.reshape(n_envs, -1))
+        traces_flat = traces.reshape(n_envs, -1) if use_traces and traces is not None else None
+        policy_out, value = ac(obs_t, prev_action, traces_flat)
         action, logp, _entropy, _max_action_stat = sample_policy_actions(
             policy_out=policy_out,
             action_mode=action_mode,
@@ -264,66 +287,77 @@ def rollout(
         trunc_buf[t] = trunc
         done_buf[t] = done
 
-        x_mem_t = encode_mem(f_mem, obs_t, prev_action)
-        xmem_buf[t] = x_mem_t
-
         next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
-        next_prev_action = action.clone()
-        if done.any():
-            next_prev_action[done] = 0
-
-        x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
-        xmem_next_buf[t] = x_mem_next
-
-        if skip_drift:
-            reset_event = torch.zeros(n_envs, device=device, dtype=torch.bool)
-            reset_buf[t] = reset_event
-            traces_next = trace_update(traces, x_mem_next, alpha_const)
+        if use_prev_action:
+            next_prev_action = action.clone()
+            if done.any():
+                if str(action_mode) == "continuous":
+                    next_prev_action[done] = 0.0
+                else:
+                    next_prev_action[done] = 0
         else:
-            if drift is None:
-                raise RuntimeError("Drift monitor is required when adaptive drift is enabled.")
-            _, v_next_prov = ac(
-                next_obs_t,
-                next_prev_action,
-                trace_update(traces, x_mem_next, alpha_base.expand(n_envs, -1)).reshape(n_envs, -1),
-            )
+            next_prev_action = None
 
-            delta_prov = rew + gamma * (~done).float() * v_next_prov - value
-            pred_err = torch.zeros(n_envs, device=device)
-            if (predictor is not None) and (lambda_pred > 0.0):
-                x_hat = predictor(x_mem_t, action)
-                pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
+        if use_traces:
+            x_mem_t = encode_mem(f_mem, obs_t, prev_action)
+            if xmem_buf is not None:
+                xmem_buf[t] = x_mem_t
 
-            e = delta_prov.abs() + lambda_pred * pred_err
+            x_mem_next = encode_mem(f_mem, next_obs_t, next_prev_action)
+            if xmem_next_buf is not None:
+                xmem_next_buf[t] = x_mem_next
 
-            gate, reset_event = drift.update(e)
-            reset_event = reset_event & (~done)
+            if skip_drift:
+                reset_event = torch.zeros(n_envs, device=device, dtype=torch.bool)
+                reset_buf[t] = reset_event
+                traces_next = trace_update(traces, x_mem_next, alpha_const)
+            else:
+                if drift is None:
+                    raise RuntimeError("Drift monitor is required when adaptive drift is enabled.")
+                _, v_next_prov = ac(
+                    next_obs_t,
+                    next_prev_action,
+                    trace_update(traces, x_mem_next, alpha_base.expand(n_envs, -1)).reshape(n_envs, -1),
+                )
 
-            reset_buf[t] = reset_event
+                delta_prov = rew + gamma * (~done).float() * v_next_prov - value
+                pred_err = torch.zeros(n_envs, device=device)
+                if (predictor is not None) and (lambda_pred > 0.0):
+                    x_hat = predictor(x_mem_t, action)
+                    pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
 
-            alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
-            alpha = alpha.clamp(0.0, 1.0)
+                e = delta_prov.abs() + lambda_pred * pred_err
 
-            traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
-            traces_next = trace_update(traces_reset, x_mem_next, alpha)
+                gate, reset_event = drift.update(e)
+                reset_event = reset_event & (~done)
 
-        done_mask = done
-        if done_mask.any():
-            if drift is not None:
-                drift.reset_where(done_mask)
-            traces_next[done_mask] = 0.0
-            traces_next[done_mask] = trace_update(
-                traces_next[done_mask],
-                x_mem_next[done_mask],
-                alpha_base.expand(done_mask.sum(), -1),
-            )
+                reset_buf[t] = reset_event
 
-        traces = traces_next
+                alpha = alpha_base + gate.unsqueeze(-1) * (alpha_max - alpha_base)
+                alpha = alpha.clamp(0.0, 1.0)
+
+                traces_reset = maybe_reset_traces(traces, reset_event, x_mem_next, reset_strategy, long_mask)
+                traces_next = trace_update(traces_reset, x_mem_next, alpha)
+
+            done_mask = done
+            if done_mask.any():
+                if drift is not None:
+                    drift.reset_where(done_mask)
+                traces_next[done_mask] = 0.0
+                traces_next[done_mask] = trace_update(
+                    traces_next[done_mask],
+                    x_mem_next[done_mask],
+                    alpha_base.expand(done_mask.sum(), -1),
+                )
+
+            traces = traces_next
+
         prev_action = next_prev_action
         obs = next_obs
 
     obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
-    _policy_out_T, value_T = ac(obs_T, prev_action, traces.reshape(n_envs, -1))
+    traces_flat_T = traces.reshape(n_envs, -1) if use_traces and traces is not None else None
+    _policy_out_T, value_T = ac(obs_T, prev_action, traces_flat_T)
 
     batch = {
         "obs": obs_buf,
@@ -356,7 +390,7 @@ def rollout_recurrent(
     gamma: float,
     obs_normalization: str,
     obs: np.ndarray,
-    prev_action: torch.Tensor,
+    prev_action: torch.Tensor | None,
     hidden: tuple[torch.Tensor, torch.Tensor],
     action_mode: str = "discrete",
     action_shape: tuple[int, ...] = (),
@@ -364,12 +398,20 @@ def rollout_recurrent(
     action_high: np.ndarray | None = None,
 ):
     n_envs = envs.num_envs
+    use_prev_action = bool(getattr(getattr(ac, "f_pol", None), "use_prev_action", True))
+    if not use_prev_action:
+        prev_action = None
     obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
     if str(action_mode) == "continuous":
-        prev_a_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
-        act_buf = torch.zeros((horizon, n_envs, int(prev_action.shape[-1])), device=device, dtype=torch.float32)
+        act_dim = int(prev_action.shape[-1]) if prev_action is not None else int(np.prod(action_shape))
+        prev_a_buf = (
+            torch.zeros((horizon, n_envs, act_dim), device=device, dtype=torch.float32)
+            if use_prev_action
+            else None
+        )
+        act_buf = torch.zeros((horizon, n_envs, act_dim), device=device, dtype=torch.float32)
     else:
-        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
+        prev_a_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64) if use_prev_action else None
         act_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.int64)
     logp_buf = torch.zeros((horizon, n_envs), device=device)
     val_buf = torch.zeros((horizon, n_envs), device=device)
@@ -384,7 +426,8 @@ def rollout_recurrent(
     for t in range(horizon):
         obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
-        prev_a_buf[t] = prev_action
+        if prev_a_buf is not None and prev_action is not None:
+            prev_a_buf[t] = prev_action
 
         policy_out, value, (h, c) = ac(obs_t, prev_action, (h, c))
         action, logp, _entropy, _max_action_stat = sample_policy_actions(
@@ -430,18 +473,20 @@ def rollout_recurrent(
                 device=device,
                 obs_normalization=obs_normalization,
             )
-            _, v_timeout, _ = ac(boot_obs_t, action[trunc_idx], (h[:, trunc_idx], c[:, trunc_idx]))
+            prev_action_boot = action[trunc_idx] if use_prev_action else None
+            _, v_timeout, _ = ac(boot_obs_t, prev_action_boot, (h[:, trunc_idx], c[:, trunc_idx]))
             rew_buf[t, trunc_idx] = rew_buf[t, trunc_idx] + (gamma * v_timeout)
 
-        next_prev_action = action.clone()
+        next_prev_action = action.clone() if use_prev_action else None
         if done.any():
             done_idx = torch.as_tensor(done, device=device)
             h[:, done_idx] = 0.0
             c[:, done_idx] = 0.0
-            if str(action_mode) == "continuous":
-                next_prev_action[done_idx] = 0.0
-            else:
-                next_prev_action[done_idx] = 0
+            if use_prev_action:
+                if str(action_mode) == "continuous":
+                    next_prev_action[done_idx] = 0.0
+                else:
+                    next_prev_action[done_idx] = 0
 
         prev_action = next_prev_action
         obs = next_obs

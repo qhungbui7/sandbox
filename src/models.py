@@ -65,20 +65,26 @@ class FeatureEncoder(nn.Module):
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
         action_type: str = "discrete",
+        use_prev_action: bool = True,
     ):
         super().__init__()
         self.encoder_type = str(encoder_type)
         self.obs_shape = tuple(obs_shape) if obs_shape is not None else None
         self.action_type = str(action_type)
         self.act_dim = int(act_dim)
-        if self.action_type == "discrete":
-            self.act_emb = nn.Embedding(act_dim, act_embed_dim)
-            self.act_proj = None
-        elif self.action_type == "continuous":
-            self.act_emb = None
-            self.act_proj = MLP(self.act_dim, hidden_dim, act_embed_dim, activation=nn.Tanh)
+        self.use_prev_action = bool(use_prev_action)
+        if self.use_prev_action:
+            if self.action_type == "discrete":
+                self.act_emb = nn.Embedding(act_dim, act_embed_dim)
+                self.act_proj = None
+            elif self.action_type == "continuous":
+                self.act_emb = None
+                self.act_proj = MLP(self.act_dim, hidden_dim, act_embed_dim, activation=nn.Tanh)
+            else:
+                raise ValueError(f"Unsupported action_type: {self.action_type}")
         else:
-            raise ValueError(f"Unsupported action_type: {self.action_type}")
+            self.act_emb = None
+            self.act_proj = None
         if self.encoder_type == "mlp":
             self.obs_encoder = MLP(obs_dim, hidden_dim, feat_dim, activation=nn.Tanh)
         elif self.encoder_type == "cnn":
@@ -88,12 +94,19 @@ class FeatureEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported encoder_type: {self.encoder_type}")
 
-        self.fuse = MLP(feat_dim + act_embed_dim, hidden_dim, feat_dim, activation=nn.Tanh)
+        if self.use_prev_action:
+            self.fuse = MLP(feat_dim + act_embed_dim, hidden_dim, feat_dim, activation=nn.Tanh)
+        else:
+            self.fuse = None
 
-    def forward(self, obs: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, prev_action: torch.Tensor | None = None) -> torch.Tensor:
         if self.encoder_type == "mlp" and obs.ndim > 2:
             obs = obs.reshape(obs.shape[0], -1)
         x_obs = self.obs_encoder(obs)
+        if not self.use_prev_action:
+            return x_obs
+        if prev_action is None:
+            raise ValueError("prev_action is required when use_prev_action=True.")
         if self.action_type == "discrete":
             a = self.act_emb(prev_action.long())
         else:
@@ -120,10 +133,13 @@ class ActorCritic(nn.Module):
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
         action_type: str = "discrete",
+        use_prev_action: bool = True,
+        use_traces: bool = True,
     ):
         super().__init__()
         self.action_type = str(action_type)
         self.act_dim = int(act_dim)
+        self.use_traces = bool(use_traces)
         self.f_pol = FeatureEncoder(
             obs_dim,
             act_dim,
@@ -133,23 +149,38 @@ class ActorCritic(nn.Module):
             encoder_type=encoder_type,
             obs_shape=obs_shape,
             action_type=self.action_type,
+            use_prev_action=use_prev_action,
         )
-        self.core = MLP(feat_dim + mem_dim, hidden_dim, hidden_dim, activation=nn.Tanh)
+        core_in_dim = int(feat_dim + (mem_dim if self.use_traces else 0))
+        self.core = MLP(core_in_dim, hidden_dim, hidden_dim, activation=nn.Tanh)
         if self.action_type == "discrete":
             self.pi = nn.Linear(hidden_dim, act_dim)
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
             init = torch.tensor([-1.0, -2.0, -2.0])
+            if int(act_dim) != int(init.numel()):
+                init = torch.full((int(act_dim),), -2.0)
+                if int(act_dim) > 0:
+                    init[0] = -1.0
             self.pi_log_std = nn.Parameter(init.clone())
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)
 
     def forward(
-        self, obs: torch.Tensor, prev_action: torch.Tensor, traces_flat: torch.Tensor
+        self,
+        obs: torch.Tensor,
+        prev_action: torch.Tensor | None = None,
+        traces_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x_pol = self.f_pol(obs, prev_action)
-        h = self.core(torch.cat([x_pol, traces_flat], dim=-1))
+        if self.use_traces:
+            if traces_flat is None:
+                raise ValueError("traces_flat is required when use_traces=True.")
+            core_in = torch.cat([x_pol, traces_flat], dim=-1)
+        else:
+            core_in = x_pol
+        h = self.core(core_in)
         if self.action_type == "discrete":
             logits = self.pi(h)
         else:
@@ -202,6 +233,7 @@ class RecurrentActorCritic(nn.Module):
         encoder_type: str = "mlp",
         obs_shape: tuple[int, ...] | None = None,
         action_type: str = "discrete",
+        use_prev_action: bool = True,
     ):
         super().__init__()
         self.action_type = str(action_type)
@@ -215,6 +247,7 @@ class RecurrentActorCritic(nn.Module):
             encoder_type=encoder_type,
             obs_shape=obs_shape,
             action_type=self.action_type,
+            use_prev_action=use_prev_action,
         )
         self.lstm = nn.LSTM(input_size=feat_dim, hidden_size=hidden_dim, num_layers=1)
         if self.action_type == "discrete":
@@ -222,6 +255,10 @@ class RecurrentActorCritic(nn.Module):
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
             init = torch.tensor([-1.0, -2.0, -2.0])
+            if int(act_dim) != int(init.numel()):
+                init = torch.full((int(act_dim),), -2.0)
+                if int(act_dim) > 0:
+                    init[0] = -1.0
             self.pi_log_std = nn.Parameter(init.clone())
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
@@ -233,7 +270,10 @@ class RecurrentActorCritic(nn.Module):
         return h, c
 
     def forward(
-        self, obs: torch.Tensor, prev_action: torch.Tensor, hidden: tuple[torch.Tensor, torch.Tensor]
+        self,
+        obs: torch.Tensor,
+        prev_action: torch.Tensor | None,
+        hidden: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         x = self.f_pol(obs, prev_action)  # [B, feat]
         x = x.unsqueeze(0)  # [1, B, feat]

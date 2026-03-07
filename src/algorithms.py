@@ -72,12 +72,17 @@ def _normalize_adv(adv: torch.Tensor) -> torch.Tensor:
     return (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
 
-def _flatten_rollout(batch: dict, adv: torch.Tensor, returns: torch.Tensor) -> dict[str, torch.Tensor | int]:
+def _flatten_rollout(batch: dict, adv: torch.Tensor, returns: torch.Tensor) -> dict[str, torch.Tensor | int | None]:
     T, N = batch["rewards"].shape
     b = T * N
-    prev_action = batch["prev_action"]
+    prev_action = batch.get("prev_action", None)
+    traces = batch.get("traces", None)
+    x_mem = batch.get("x_mem", None)
+    x_mem_next = batch.get("x_mem_next", None)
     actions = batch["actions"]
-    if prev_action.ndim == 2:
+    if prev_action is None:
+        prev_a_f = None
+    elif prev_action.ndim == 2:
         prev_a_f = prev_action.reshape(b)
     else:
         prev_a_f = prev_action.reshape(b, -1)
@@ -91,14 +96,14 @@ def _flatten_rollout(batch: dict, adv: torch.Tensor, returns: torch.Tensor) -> d
         "B": b,
         "obs_f": batch["obs"].reshape((b, *batch["obs"].shape[2:])),
         "prev_a_f": prev_a_f,
-        "traces_f": batch["traces"].reshape(b, -1),
+        "traces_f": (traces.reshape(b, -1) if traces is not None else None),
         "actions_f": actions_f,
         "logp_old_f": batch["logp_old"].reshape(b),
         "values_old_f": batch["values_old"].reshape(b),
         "adv_f": _normalize_adv(adv.reshape(b)),
         "returns_f": returns.reshape(b),
-        "x_mem_f": batch["x_mem"].reshape(b, -1),
-        "x_mem_next_f": batch["x_mem_next"].reshape(b, -1),
+        "x_mem_f": (x_mem.reshape(b, -1) if x_mem is not None else None),
+        "x_mem_next_f": (x_mem_next.reshape(b, -1) if x_mem_next is not None else None),
     }
 
 
@@ -172,12 +177,24 @@ def _update_tensor_reservoir(
 def _pred_loss(
     pred: Predictor | None,
     pred_coef: float,
-    x_mem: torch.Tensor,
+    x_mem: torch.Tensor | None,
     actions: torch.Tensor,
-    x_mem_next: torch.Tensor,
+    x_mem_next: torch.Tensor | None,
+    *,
+    device: str | torch.device | None = None,
 ) -> torch.Tensor:
+    if x_mem is not None:
+        out_device = x_mem.device
+    elif x_mem_next is not None:
+        out_device = x_mem_next.device
+    elif device is not None:
+        out_device = device
+    else:
+        out_device = "cpu"
     if pred is None or pred_coef <= 0.0:
-        return torch.zeros((), device=x_mem.device)
+        return torch.zeros((), device=out_device)
+    if x_mem is None or x_mem_next is None:
+        raise RuntimeError("Predictor loss requires trace memory features (x_mem/x_mem_next).")
     x_hat = pred(x_mem, actions)
     return (x_mem_next - x_hat).pow(2).mean()
 
@@ -300,7 +317,9 @@ def ppo_update(
         for start in range(0, flat["B"], minibatch_size):
             mb = perm[start : start + minibatch_size]
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                policy_out, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
+                prev_a_mb = flat["prev_a_f"][mb] if flat["prev_a_f"] is not None else None
+                traces_mb = flat["traces_f"][mb] if flat["traces_f"] is not None else None
+                policy_out, values = ac(flat["obs_f"][mb], prev_a_mb, traces_mb)
                 logp, entropy, max_action_prob = evaluate_policy_actions(
                     policy_out=policy_out,
                     actions=flat["actions_f"][mb],
@@ -325,9 +344,10 @@ def ppo_update(
                 pred_loss = _pred_loss(
                     pred=pred,
                     pred_coef=pred_coef,
-                    x_mem=flat["x_mem_f"][mb],
+                    x_mem=(flat["x_mem_f"][mb] if flat["x_mem_f"] is not None else None),
                     actions=flat["actions_f"][mb],
-                    x_mem_next=flat["x_mem_next_f"][mb],
+                    x_mem_next=(flat["x_mem_next_f"][mb] if flat["x_mem_next_f"] is not None else None),
+                    device=idx.device,
                 )
                 loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
