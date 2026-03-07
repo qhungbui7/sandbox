@@ -3,6 +3,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import gymnasium as gym
 
+try:
+    import albumentations as A
+except ImportError:  # pragma: no cover - optional dependency for CarRacing preprocessing
+    A = None
+
 
 class PartialObsWrapper(gym.ObservationWrapper):
     def __init__(self, env: gym.Env, mask_indices: list[int]):
@@ -131,6 +136,11 @@ class CarRacingPreprocessWrapper(gym.ObservationWrapper):
         super().__init__(env)
         if not isinstance(env.observation_space, gym.spaces.Box):
             raise TypeError("CarRacingPreprocessWrapper expects a Box observation space.")
+        if A is None:
+            raise ImportError(
+                "CarRacingPreprocessWrapper requires `albumentations`. "
+                "Install dependencies from requirements.txt."
+            )
         downsample = int(downsample)
         if downsample < 1:
             raise ValueError("--carracing-downsample must be >= 1.")
@@ -147,25 +157,32 @@ class CarRacingPreprocessWrapper(gym.ObservationWrapper):
 
         out_h = h // self.downsample
         out_w = w // self.downsample
+        if out_h < 1 or out_w < 1:
+            raise ValueError(
+                f"--carracing-downsample={self.downsample} is too large for input shape {shape}; "
+                "resulting image size must be at least 1x1."
+            )
         out_c = 1 if self.grayscale else c
         out_shape = (out_h, out_w, out_c)
 
         low = np.full(out_shape, float(np.min(space.low)), dtype=space.dtype)
         high = np.full(out_shape, float(np.max(space.high)), dtype=space.dtype)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=space.dtype)
+        transforms: list = []
+        if self.downsample > 1:
+            transforms.append(A.Resize(height=out_h, width=out_w, p=1.0))
+        if self.grayscale:
+            transforms.append(A.ToGray(num_output_channels=1, p=1.0))
+        self._transform = A.Compose(transforms)
 
     def observation(self, observation):
         obs = np.asarray(observation)
-        if self.downsample > 1:
-            obs = obs[:: self.downsample, :: self.downsample, :]
-        if self.grayscale:
-            r = obs[..., 0].astype(np.float32)
-            g = obs[..., 1].astype(np.float32)
-            b = obs[..., 2].astype(np.float32)
-            gray = 0.299 * r + 0.587 * g + 0.114 * b
-            gray_u8 = np.clip(gray, 0.0, 255.0).astype(np.uint8)
-            obs = gray_u8[..., None]
-        return obs
+        out = self._transform(image=obs)["image"]
+        if out.ndim == 2:
+            out = out[..., None]
+        if out.dtype != self.observation_space.dtype:
+            out = out.astype(self.observation_space.dtype, copy=False)
+        return out
 
 
 class FrameStackLastAxisWrapper(gym.Wrapper):

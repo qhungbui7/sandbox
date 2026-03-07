@@ -123,6 +123,8 @@ def _build_active_args(args: dict) -> dict:
         "horizon",
         "total_steps",
         "lr",
+        "lr_schedule",
+        "lr_end",
         "gamma",
         "gae_lam",
         "run_note",

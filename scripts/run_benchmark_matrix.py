@@ -171,6 +171,8 @@ def run_postprocess(
         "scripts/record_gameplay.py",
         "--run-dir",
         str(run_dir),
+        "--checkpoint-kind",
+        "both",
         "--episodes",
         str(gameplay_episodes),
         "--deterministic",
@@ -277,7 +279,12 @@ def main() -> None:
         help="Optional shared gameplay output dir override. Default is per-run: <report-dir>/<run-name>/gameplay.",
     )
     p.add_argument("--analysis-dir", type=str, default=None, help="Summary output dir (default: <report-dir>/analysis).")
-    p.add_argument("--gameplay-episodes", type=int, default=2, help="Episodes recorded per run when --visualize is enabled.")
+    p.add_argument(
+        "--gameplay-episodes",
+        type=int,
+        default=2,
+        help="Episodes per checkpoint when --visualize is enabled (best + last, so total videos = 2x this value).",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--continue-on-error", action="store_true")
     args = p.parse_args()

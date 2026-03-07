@@ -172,6 +172,8 @@ def _strict_args_template(**overrides):
         reward_scale_high=1.2,
         gamma=0.99,
         lr=3e-4,
+        lr_schedule="linear",
+        lr_end=None,
         max_grad_norm=0.5,
         vf_coef=0.5,
         ent_coef=0.01,
@@ -311,6 +313,28 @@ def test_validate_no_strange_params_rejects_algo_specific_cli_knob():
         assert "not used" in str(exc)
     else:
         raise AssertionError("Expected strict validator to reject DQN-only CLI key for PPO.")
+
+
+def test_validate_no_strange_params_rejects_lr_end_for_none_schedule():
+    args = _strict_args_template(reset_strategy="partial", lr_schedule="none", lr_end=1e-5)
+    resolved_cfg = vars(args).copy()
+    try:
+        validate_no_strange_params(args, resolved_cfg=resolved_cfg, cli_dests=set())
+    except ValueError as exc:
+        assert "lr_end" in str(exc)
+    else:
+        raise AssertionError("Expected strict validator to reject `lr_end` when lr_schedule is none.")
+
+
+def test_validate_no_strange_params_rejects_lr_end_above_lr_for_linear_schedule():
+    args = _strict_args_template(reset_strategy="partial", lr_schedule="linear", lr=3e-4, lr_end=5e-4)
+    resolved_cfg = vars(args).copy()
+    try:
+        validate_no_strange_params(args, resolved_cfg=resolved_cfg, cli_dests=set())
+    except ValueError as exc:
+        assert "lr_end" in str(exc)
+    else:
+        raise AssertionError("Expected strict validator to reject `lr_end > lr` for linear schedule.")
 
 
 def test_validate_no_strange_params_rejects_a2c_multiple_epochs():
