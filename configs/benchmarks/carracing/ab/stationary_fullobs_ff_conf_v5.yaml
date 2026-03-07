@@ -15,7 +15,7 @@ overrides:
     reward_scale_high: 1.0
   model:
     algo: ppo
-    policy: recurrent
+    policy: ff
     encoder: cnn
 
   training:
@@ -24,10 +24,11 @@ overrides:
     horizon: 256
     total_steps: 1001472 # 102400 # 5001216
     epochs: 8
-    ent_coef: 1e-2
+    ent_coef: 1e-3
     vf_coef: 0.25
     max_grad_norm: 0.5
     lr: 0.0003
+    lr_schedule: none
     target_kl : 0.01
   other:
     device: cuda
