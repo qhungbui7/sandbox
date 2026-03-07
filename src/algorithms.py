@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 
+from src.action_utils import evaluate_policy_actions
 from src.amt import DriftMonitor, encode_mem, maybe_reset_traces, trace_update
 from src.envs import EnvPool
 from src.models import ActorCritic, FeatureEncoder, Predictor
@@ -74,14 +75,24 @@ def _normalize_adv(adv: torch.Tensor) -> torch.Tensor:
 def _flatten_rollout(batch: dict, adv: torch.Tensor, returns: torch.Tensor) -> dict[str, torch.Tensor | int]:
     T, N = batch["rewards"].shape
     b = T * N
+    prev_action = batch["prev_action"]
+    actions = batch["actions"]
+    if prev_action.ndim == 2:
+        prev_a_f = prev_action.reshape(b)
+    else:
+        prev_a_f = prev_action.reshape(b, -1)
+    if actions.ndim == 2:
+        actions_f = actions.reshape(b)
+    else:
+        actions_f = actions.reshape(b, -1)
     return {
         "T": T,
         "N": N,
         "B": b,
         "obs_f": batch["obs"].reshape((b, *batch["obs"].shape[2:])),
-        "prev_a_f": batch["prev_action"].reshape(b),
+        "prev_a_f": prev_a_f,
         "traces_f": batch["traces"].reshape(b, -1),
-        "actions_f": batch["actions"].reshape(b),
+        "actions_f": actions_f,
         "logp_old_f": batch["logp_old"].reshape(b),
         "values_old_f": batch["values_old"].reshape(b),
         "adv_f": _normalize_adv(adv.reshape(b)),
@@ -194,6 +205,7 @@ def ppo_update(
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
 ) -> dict[str, float]:
+    action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
         batch["rewards"],
@@ -217,7 +229,7 @@ def ppo_update(
 
     debug_enabled = debug_cfg is not None
     if debug_enabled:
-        action_bins = int(debug_cfg["action_bins"])
+        action_bins = int(debug_cfg["action_bins"]) if action_mode == "discrete" else 0
         ratio_cap = int(debug_cfg["ratio_sample_size"])
         delta_pairs = int(debug_cfg["frame_delta_pairs"])
         seed = int(debug_cfg["seed"])
@@ -249,7 +261,11 @@ def ppo_update(
         var_returns = flat["returns_f"].var(unbiased=False)
         explained_var = 1.0 - (td_error.var(unbiased=False) / (var_returns + 1e-8))
 
-        action_hist = torch.bincount(flat["actions_f"], minlength=action_bins).float()[:action_bins]
+        action_hist = (
+            torch.bincount(flat["actions_f"].long(), minlength=action_bins).float()[:action_bins]
+            if action_mode == "discrete"
+            else None
+        )
         ratio_reservoir = torch.zeros((ratio_cap,), device=idx.device)
         ratio_filled = 0
 
@@ -262,10 +278,11 @@ def ppo_update(
         sum_grad_core = torch.zeros((), device=idx.device)
         sum_grad_pi = torch.zeros((), device=idx.device)
         sum_grad_v = torch.zeros((), device=idx.device)
+        pi_module = ac.pi if hasattr(ac, "pi") else ac.pi_mean
         grad_modules = {
             "encoder": ac.f_pol.obs_encoder,
             "core": ac.core,
-            "pi": ac.pi,
+            "pi": pi_module,
             "v": ac.v,
         }
     else:
@@ -281,10 +298,12 @@ def ppo_update(
         for start in range(0, flat["B"], minibatch_size):
             mb = perm[start : start + minibatch_size]
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
-                dist = Categorical(logits=logits)
-                logp = dist.log_prob(flat["actions_f"][mb])
-                entropy = dist.entropy().mean()
+                policy_out, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
+                logp, entropy, max_action_prob = evaluate_policy_actions(
+                    policy_out=policy_out,
+                    actions=flat["actions_f"][mb],
+                    action_mode=action_mode,
+                )
 
                 log_ratio = logp - flat["logp_old_f"][mb]
                 ratio = log_ratio.exp()
@@ -331,7 +350,6 @@ def ppo_update(
                 if debug_enabled:
                     sum_total = sum_total + loss.detach().float()
                     max_approx_kl = torch.maximum(max_approx_kl, approx_kl.detach().float())
-                    max_action_prob = logits.float().softmax(dim=-1).max(dim=-1).values.mean()
                     sum_max_action_prob = sum_max_action_prob + max_action_prob
                     sum_grad_global = sum_grad_global + global_grad_norm
                     max_grad_global = torch.maximum(max_grad_global, global_grad_norm)
@@ -398,13 +416,17 @@ def ppo_update(
                 "debug/value/explained_variance": float(explained_var.item()),
                 "debug/value/td_error_mean": float(td_error.mean().item()),
                 "debug/value/td_error_std": float(td_std.item()),
-                "debug/action/max_action_prob_mean": float((sum_max_action_prob * inv_count).item()),
+                "debug/action/max_action_prob_mean": float((sum_max_action_prob * inv_count).item())
+                if action_mode == "discrete"
+                else float("nan"),
                 "debug/ppo/mb_count": float(count),
                 "debug/ppo/ratio_sample_count": float(ratio_filled),
             }
         )
-        for action_idx in range(action_bins):
-            stats[f"debug/action/hist_{action_idx}"] = float(action_hist[action_idx].item())
+        if action_mode == "discrete":
+            assert action_hist is not None
+            for action_idx in range(action_bins):
+                stats[f"debug/action/hist_{action_idx}"] = float(action_hist[action_idx].item())
 
     return stats
 

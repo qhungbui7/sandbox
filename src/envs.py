@@ -258,7 +258,11 @@ class EnvPool:
         obs, rew, term, trunc, infos = [], [], [], [], []
         final_obs: dict[int, np.ndarray] = {}
 
-        actions_i = [int(actions[i]) for i in range(self.num_envs)]
+        if isinstance(self.single_action_space, gym.spaces.Discrete):
+            actions_i = [int(actions[i]) for i in range(self.num_envs)]
+        else:
+            space_dtype = getattr(self.single_action_space, "dtype", np.float32)
+            actions_i = [np.asarray(actions[i], dtype=space_dtype) for i in range(self.num_envs)]
         if self._executor is None:
             results = [env.step(actions_i[i]) for i, env in enumerate(self.envs)]
         else:

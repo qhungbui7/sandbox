@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 
+from src.action_utils import evaluate_policy_actions
 from src.models import ActorCritic, Predictor, RecurrentActorCritic
 from src.utils import autocast_context
 
@@ -123,6 +123,7 @@ def ppo_update(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
+    action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
     prev_a = batch["prev_action"]
     traces = batch["traces"]
@@ -142,9 +143,15 @@ def ppo_update(
     b = T * N
 
     obs_f = obs.reshape((b, *obs.shape[2:]))
-    prev_a_f = prev_a.reshape(b)
+    if prev_a.ndim == 2:
+        prev_a_f = prev_a.reshape(b)
+    else:
+        prev_a_f = prev_a.reshape(b, -1)
     traces_f = traces.reshape(b, -1)
-    actions_f = actions.reshape(b)
+    if actions.ndim == 2:
+        actions_f = actions.reshape(b)
+    else:
+        actions_f = actions.reshape(b, -1)
     logp_old_f = logp_old.reshape(b)
     values_old_f = values_old.reshape(b)
     adv_f = adv.reshape(b)
@@ -172,10 +179,12 @@ def ppo_update(
             mb = perm[start : start + minibatch_size]
 
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(obs_f[mb], prev_a_f[mb], traces_f[mb])
-                dist = Categorical(logits=logits)
-                logp = dist.log_prob(actions_f[mb])
-                entropy = dist.entropy().mean()
+                policy_out, values = ac(obs_f[mb], prev_a_f[mb], traces_f[mb])
+                logp, entropy, _max_action_prob = evaluate_policy_actions(
+                    policy_out=policy_out,
+                    actions=actions_f[mb],
+                    action_mode=action_mode,
+                )
 
                 log_ratio = logp - logp_old_f[mb]
                 ratio = log_ratio.exp()
@@ -257,6 +266,7 @@ def ppo_update_recurrent(
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
 ) -> dict[str, float]:
+    action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
     prev_a = batch["prev_action"]
     actions = batch["actions"]
@@ -283,7 +293,7 @@ def ppo_update_recurrent(
 
     debug_enabled = debug_cfg is not None
     if debug_enabled:
-        action_bins = int(debug_cfg["action_bins"])
+        action_bins = int(debug_cfg["action_bins"]) if action_mode == "discrete" else 0
         ratio_cap = int(debug_cfg["ratio_sample_size"])
         delta_pairs = int(debug_cfg["frame_delta_pairs"])
         seed = int(debug_cfg["seed"])
@@ -317,7 +327,10 @@ def ppo_update_recurrent(
         var_returns = returns_f.var(unbiased=False)
         explained_var = 1.0 - (td_error.var(unbiased=False) / (var_returns + 1e-8))
 
-        action_hist = torch.bincount(actions.reshape(-1), minlength=action_bins).float()[:action_bins]
+        if action_mode == "discrete":
+            action_hist = torch.bincount(actions.reshape(-1).long(), minlength=action_bins).float()[:action_bins]
+        else:
+            action_hist = None
         ratio_reservoir = torch.zeros((ratio_cap,), device=obs.device)
         ratio_filled = 0
 
@@ -330,10 +343,11 @@ def ppo_update_recurrent(
         sum_grad_core = torch.zeros((), device=obs.device)
         sum_grad_pi = torch.zeros((), device=obs.device)
         sum_grad_v = torch.zeros((), device=obs.device)
+        pi_module = ac.pi if hasattr(ac, "pi") else ac.pi_mean
         grad_modules = {
             "encoder": ac.f_pol.obs_encoder,
             "core": ac.lstm,
-            "pi": ac.pi,
+            "pi": pi_module,
             "v": ac.v,
         }
     else:
@@ -357,14 +371,19 @@ def ppo_update_recurrent(
 
             for t in range(T):
                 with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                    logits, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
-                    dist = Categorical(logits=logits)
-                    lp = dist.log_prob(actions[t, env_id : env_id + 1]).squeeze(-1)
+                    policy_out, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a[t, env_id : env_id + 1], (h, c))
+                    action_t = actions[t, env_id : env_id + 1]
+                    logp_t, entropy_t, max_prob_t = evaluate_policy_actions(
+                        policy_out=policy_out,
+                        actions=action_t,
+                        action_mode=action_mode,
+                    )
+                    lp = logp_t.squeeze(-1)
                     traj_logp.append(lp)
                     traj_values.append(value)
-                    traj_entropy.append(dist.entropy().mean())
+                    traj_entropy.append(entropy_t)
                     if debug_enabled:
-                        traj_max_action_prob.append(logits.float().softmax(dim=-1).max(dim=-1).values.mean())
+                        traj_max_action_prob.append(max_prob_t)
                 done_t = dones[t, env_id].to(dtype=h.dtype)
                 h = h * (1.0 - done_t)
                 c = c * (1.0 - done_t)
@@ -484,12 +503,16 @@ def ppo_update_recurrent(
                 "debug/value/explained_variance": float(explained_var.item()),
                 "debug/value/td_error_mean": float(td_error.mean().item()),
                 "debug/value/td_error_std": float(td_std.item()),
-                "debug/action/max_action_prob_mean": float((sum_max_action_prob * inv_count).item()),
+                "debug/action/max_action_prob_mean": float((sum_max_action_prob * inv_count).item())
+                if action_mode == "discrete"
+                else float("nan"),
                 "debug/ppo/mb_count": float(count),
                 "debug/ppo/ratio_sample_count": float(ratio_filled),
             }
         )
-        for action_idx in range(action_bins):
-            stats[f"debug/action/hist_{action_idx}"] = float(action_hist[action_idx].item())
+        if action_mode == "discrete":
+            assert action_hist is not None
+            for action_idx in range(action_bins):
+                stats[f"debug/action/hist_{action_idx}"] = float(action_hist[action_idx].item())
 
     return stats
