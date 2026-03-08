@@ -20,10 +20,14 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _safe_git_sha(repo_root: Path) -> str | None:
+def _safe_git_sha(repo_root: Path, *, short: bool = True) -> str | None:
+    args = ["git", "rev-parse"]
+    if short:
+        args.append("--short")
+    args.append("HEAD")
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            args,
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -539,7 +543,8 @@ def start_run_report(
         "run_note": args.get("run_note"),
         "run_identity": run_identity,
         "config_path": config_path,
-        "git_sha": _safe_git_sha(repo_root),
+        "git_sha": _safe_git_sha(repo_root, short=True),
+        "git_commit_hash": _safe_git_sha(repo_root, short=False),
         # Keep only run-relevant arguments in summary to avoid noisy defaults
         # from inactive algorithms/policies.
         "args": active_args,
@@ -576,6 +581,7 @@ def start_run_report(
     reporter.log_line(f"# timestamp_utc: {summary.get('timestamp')}")
     reporter.log_line(f"# run_dir: {run_dir.as_posix()}")
     reporter.log_line(f"# git_sha: {summary.get('git_sha')}")
+    reporter.log_line(f"# git_commit_hash: {summary.get('git_commit_hash')}")
     reporter.log_line(f"# command: {summary.get('command')}")
     reporter.log_line(f"# run_note: {summary.get('run_note')}")
     reporter.log_line(f"# config_path: {summary.get('config_path')}")
