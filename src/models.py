@@ -157,12 +157,7 @@ class ActorCritic(nn.Module):
             self.pi = nn.Linear(hidden_dim, act_dim)
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
-            init = torch.tensor([-1.0, -2.0, -2.0])
-            if int(act_dim) != int(init.numel()):
-                init = torch.full((int(act_dim),), -2.0)
-                if int(act_dim) > 0:
-                    init[0] = -1.0
-            self.pi_log_std = nn.Parameter(init.clone())
+            self.pi_log_std = nn.Parameter(torch.zeros(int(act_dim), dtype=torch.float32))
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)
@@ -254,12 +249,7 @@ class RecurrentActorCritic(nn.Module):
             self.pi = nn.Linear(hidden_dim, act_dim)
         elif self.action_type == "continuous":
             self.pi_mean = nn.Linear(hidden_dim, act_dim)
-            init = torch.tensor([-1.0, -2.0, -2.0])
-            if int(act_dim) != int(init.numel()):
-                init = torch.full((int(act_dim),), -2.0)
-                if int(act_dim) > 0:
-                    init[0] = -1.0
-            self.pi_log_std = nn.Parameter(init.clone())
+            self.pi_log_std = nn.Parameter(torch.zeros(int(act_dim), dtype=torch.float32))
         else:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         self.v = nn.Linear(hidden_dim, 1)

@@ -35,6 +35,9 @@ def test_run_reporter_writes_metrics_logs_and_summary(tmp_path: Path):
     assert summary["active_args"]["policy"] == "ff"
     assert summary["active_args"]["algo"] == "ppo"
     assert summary["active_args"]["env_id"] == "CartPole-v1"
+    assert "git_commit_hash" in summary
+    if (summary.get("git_commit_hash") is not None) and (summary.get("git_sha") is not None):
+        assert str(summary["git_commit_hash"]).startswith(str(summary["git_sha"]))
 
     metrics_path = Path(summary["artifacts"]["metrics_jsonl"])
     metrics_csv_path = Path(summary["artifacts"]["metrics_csv"])

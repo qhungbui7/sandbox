@@ -1,0 +1,39 @@
+config_paths:
+  env: ../../../env/benchmarks/carracing/stationary_fullobs.yaml
+  model: ../../../model/benchmarks/recurrent_ppo.yaml
+  training: ../../../training/benchmarks/carracing_102400.yaml
+  other: ../../../other/benchmark_reporting.yaml
+overrides:
+  env:
+    env_id: CarRacing-v3
+    carracing_downsample: 1 # 2
+    carracing_grayscale: false # false # true
+    mask_indices: []
+    phase_len: 0
+    obs_shift_scale: 0.0
+    reward_scale_low: 1.0
+    reward_scale_high: 1.0
+  model:
+    algo: ppo
+    policy: ff
+    encoder: cnn
+
+  training:
+    num_envs: 8
+    env_workers: 2
+    horizon: 256
+    total_steps: 1001472 # 102400 # 5001216
+    epochs: 8
+    ent_coef: 1e-3
+    vf_coef: 0.25
+    max_grad_norm: 0.5
+    lr: 0.0003
+    lr_schedule: none
+    target_kl : 0.01
+  other:
+    device: cuda
+    seed: 0
+    wandb: false
+    report: true
+    report_dir: reports/benchmarks
+    report_run_name: carracing_stationary_fullobs_recurrent_vf025_gn1_lr1e-3
