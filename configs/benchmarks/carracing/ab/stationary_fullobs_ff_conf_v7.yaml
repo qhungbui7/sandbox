@@ -17,6 +17,8 @@ overrides:
     algo: ppo
     policy: ff
     encoder: cnn
+    use_prev_action: true
+    use_traces: true
 
   training:
     num_envs: 8
