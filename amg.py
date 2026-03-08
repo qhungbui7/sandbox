@@ -247,6 +247,7 @@ DQN_ONLY_KEYS = {
     "dqn_eps_start",
     "dqn_eps_end",
     "dqn_eps_decay_steps",
+    "dqn_pin_memory",
 }
 
 
@@ -2097,6 +2098,12 @@ def main():
     p.add_argument("--dqn-eps-start", type=float, default=1.0)
     p.add_argument("--dqn-eps-end", type=float, default=0.05)
     p.add_argument("--dqn-eps-decay-steps", type=int, default=100_000)
+    p.add_argument(
+        "--dqn-pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use pinned CPU replay buffers and non-blocking host-to-device copies during DQN updates on CUDA.",
+    )
 
     p.add_argument("--mask-indices", type=str, default="1,3")
     p.add_argument("--phase-len", type=int, default=2000)
@@ -2641,7 +2648,12 @@ def main():
         ).to(device)
         hard_update_(dqn_target_ac, ac)
         dqn_target_ac = maybe_compile_module(dqn_target_ac, enabled=bool(args.compile), mode=str(args.compile_mode))
-        replay = DQNReplayBuffer(capacity=args.dqn_replay_size, obs_dim=obs_dim, trace_dim=mem_dim)
+        replay = DQNReplayBuffer(
+            capacity=args.dqn_replay_size,
+            obs_dim=obs_dim,
+            trace_dim=mem_dim,
+            pin_memory=bool(args.dqn_pin_memory) and str(device).startswith("cuda"),
+        )
         reporter.log_block(
             "dqn",
             {

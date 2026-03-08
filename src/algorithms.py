@@ -1119,19 +1119,26 @@ def update_on_policy(
 
 
 class DQNReplayBuffer:
-    def __init__(self, capacity: int, obs_dim: int, trace_dim: int):
+    def __init__(self, capacity: int, obs_dim: int, trace_dim: int, pin_memory: bool = False):
         self.capacity = int(capacity)
-        self.obs = torch.zeros((self.capacity, obs_dim), dtype=torch.float32)
-        self.prev_action = torch.zeros(self.capacity, dtype=torch.int64)
-        self.traces = torch.zeros((self.capacity, trace_dim), dtype=torch.float32)
-        self.actions = torch.zeros(self.capacity, dtype=torch.int64)
-        self.rewards = torch.zeros(self.capacity, dtype=torch.float32)
-        self.dones = torch.zeros(self.capacity, dtype=torch.bool)
-        self.next_obs = torch.zeros((self.capacity, obs_dim), dtype=torch.float32)
-        self.next_prev_action = torch.zeros(self.capacity, dtype=torch.int64)
-        self.next_traces = torch.zeros((self.capacity, trace_dim), dtype=torch.float32)
+        self.pin_memory = bool(pin_memory) and torch.cuda.is_available()
+        self.obs = self._alloc((self.capacity, obs_dim), dtype=torch.float32)
+        self.prev_action = self._alloc(self.capacity, dtype=torch.int64)
+        self.traces = self._alloc((self.capacity, trace_dim), dtype=torch.float32)
+        self.actions = self._alloc(self.capacity, dtype=torch.int64)
+        self.rewards = self._alloc(self.capacity, dtype=torch.float32)
+        self.dones = self._alloc(self.capacity, dtype=torch.bool)
+        self.next_obs = self._alloc((self.capacity, obs_dim), dtype=torch.float32)
+        self.next_prev_action = self._alloc(self.capacity, dtype=torch.int64)
+        self.next_traces = self._alloc((self.capacity, trace_dim), dtype=torch.float32)
         self.pos = 0
         self.size = 0
+
+    def _alloc(self, shape, *, dtype: torch.dtype) -> torch.Tensor:
+        tensor = torch.zeros(shape, dtype=dtype)
+        if self.pin_memory:
+            return tensor.pin_memory()
+        return tensor
 
     def __len__(self) -> int:
         return self.size
@@ -1204,16 +1211,17 @@ class DQNReplayBuffer:
         if self.size < batch_size:
             raise ValueError(f"Replay has only {self.size} transitions, needs {batch_size}")
         idx = torch.randint(0, self.size, (batch_size,), generator=generator)
+        non_blocking = self.pin_memory and str(device).startswith("cuda")
         return {
-            "obs": self.obs[idx].to(device),
-            "prev_action": self.prev_action[idx].to(device),
-            "traces": self.traces[idx].to(device),
-            "actions": self.actions[idx].to(device),
-            "rewards": self.rewards[idx].to(device),
-            "dones": self.dones[idx].to(device),
-            "next_obs": self.next_obs[idx].to(device),
-            "next_prev_action": self.next_prev_action[idx].to(device),
-            "next_traces": self.next_traces[idx].to(device),
+            "obs": self.obs[idx].to(device, non_blocking=non_blocking),
+            "prev_action": self.prev_action[idx].to(device, non_blocking=non_blocking),
+            "traces": self.traces[idx].to(device, non_blocking=non_blocking),
+            "actions": self.actions[idx].to(device, non_blocking=non_blocking),
+            "rewards": self.rewards[idx].to(device, non_blocking=non_blocking),
+            "dones": self.dones[idx].to(device, non_blocking=non_blocking),
+            "next_obs": self.next_obs[idx].to(device, non_blocking=non_blocking),
+            "next_prev_action": self.next_prev_action[idx].to(device, non_blocking=non_blocking),
+            "next_traces": self.next_traces[idx].to(device, non_blocking=non_blocking),
         }
 
 

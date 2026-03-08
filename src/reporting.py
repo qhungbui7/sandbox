@@ -211,6 +211,7 @@ def _build_active_args(args: dict) -> dict:
             "dqn_eps_start",
             "dqn_eps_end",
             "dqn_eps_decay_steps",
+            "dqn_pin_memory",
         ],
     }
 
