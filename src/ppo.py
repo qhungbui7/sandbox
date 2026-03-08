@@ -122,8 +122,6 @@ def ppo_update(
     use_amp: bool,
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
-    action_low=None,
-    action_high=None,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
@@ -190,8 +188,6 @@ def ppo_update(
                     policy_out=policy_out,
                     actions=actions_f[mb],
                     action_mode=action_mode,
-                    action_low=action_low,
-                    action_high=action_high,
                 )
 
                 log_ratio = logp - logp_old_f[mb]
@@ -275,8 +271,6 @@ def ppo_update_recurrent(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
-    action_low=None,
-    action_high=None,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
@@ -390,8 +384,6 @@ def ppo_update_recurrent(
                         policy_out=policy_out,
                         actions=action_t,
                         action_mode=action_mode,
-                        action_low=action_low,
-                        action_high=action_high,
                     )
                     lp = logp_t.squeeze(-1)
                     traj_logp.append(lp)

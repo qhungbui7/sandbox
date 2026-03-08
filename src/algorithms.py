@@ -221,8 +221,6 @@ def ppo_update(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
     debug_cfg: dict | None = None,
-    action_low=None,
-    action_high=None,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     bootstrap_stops = batch["dones"]
@@ -324,8 +322,6 @@ def ppo_update(
                     policy_out=policy_out,
                     actions=flat["actions_f"][mb],
                     action_mode=action_mode,
-                    action_low=action_low,
-                    action_high=action_high,
                 )
 
                 log_ratio = logp - flat["logp_old_f"][mb]
@@ -990,8 +986,6 @@ def update_on_policy(
     vmpo_kl_coef: float,
     vmpo_kl_target: float,
     debug_cfg: dict | None = None,
-    action_low=None,
-    action_high=None,
 ) -> dict[str, float]:
     algo_name = normalize_algo_name(algo)
     if algo_name == "ppo":
@@ -1017,8 +1011,6 @@ def update_on_policy(
             amp_dtype=amp_dtype,
             grad_scaler=grad_scaler,
             debug_cfg=debug_cfg,
-            action_low=action_low,
-            action_high=action_high,
         )
     if algo_name == "a2c":
         return a2c_update(
