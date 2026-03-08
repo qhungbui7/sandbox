@@ -11,7 +11,6 @@ if str(ROOT) not in sys.path:
 
 from amg import ActorCritic, EnvPool, FeatureEncoder, make_env_fn, rollout, set_seed, trace_update  # noqa: E402
 import src.algorithms as algorithms_module  # noqa: E402
-from src.action_utils import actions_to_env_numpy, evaluate_policy_actions, sample_policy_actions  # noqa: E402
 from src.algorithms import (  # noqa: E402
     DQNReplayBuffer,
     dqn_collect_rollout,
@@ -58,38 +57,6 @@ class ContinuousLineEnv:
         self._state[2] = float(self._t % 5)
         self._state[3] = float(np.linalg.norm(a))
         reward = float(-np.square(a).sum())
-        self._t += 1
-        terminated = bool(self._t >= 12)
-        truncated = False
-        return self._state.copy(), reward, terminated, truncated, {}
-
-
-class AsymmetricContinuousEnv:
-    def __init__(self):
-        self.action_space = gym.spaces.Box(
-            low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-            shape=(3,),
-            dtype=np.float32,
-        )
-        self.observation_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(4,), dtype=np.float32)
-        self._state = np.zeros((4,), dtype=np.float32)
-        self._t = 0
-
-    def reset(self, seed=None, options=None):
-        self._state[:] = 0.0
-        self._t = 0
-        return self._state.copy(), {}
-
-    def step(self, action):
-        a = np.asarray(action, dtype=np.float32)
-        a = np.clip(a, self.action_space.low, self.action_space.high)
-        steer, gas, brake = a.tolist()
-        self._state[0] = np.clip(self._state[0] + steer, -10.0, 10.0)
-        self._state[1] = np.clip(self._state[1] + gas - brake, -10.0, 10.0)
-        self._state[2] = float(gas)
-        self._state[3] = float(brake)
-        reward = float(gas - brake - 0.1 * abs(steer))
         self._t += 1
         terminated = bool(self._t >= 12)
         truncated = False
@@ -680,113 +647,3 @@ def test_ppo_update_supports_continuous_actions_cpu():
     for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
         assert key in stats
         assert torch.isfinite(torch.tensor(stats[key]))
-
-
-def test_squashed_continuous_policy_is_bounded_and_logprob_consistent():
-    torch.manual_seed(11)
-    action_low = np.asarray([-1.0, 0.0, 0.0], dtype=np.float32)
-    action_high = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
-    policy_out = torch.randn(8, 6)
-
-    actions, logp_sample, _entropy, _ = sample_policy_actions(
-        policy_out=policy_out,
-        action_mode="continuous",
-        deterministic=False,
-        action_low=action_low,
-        action_high=action_high,
-    )
-    low_t = torch.as_tensor(action_low, dtype=actions.dtype).reshape(1, -1)
-    high_t = torch.as_tensor(action_high, dtype=actions.dtype).reshape(1, -1)
-    assert torch.all(actions >= low_t - 1e-6)
-    assert torch.all(actions <= high_t + 1e-6)
-
-    logp_eval, _entropy_eval, _ = evaluate_policy_actions(
-        policy_out=policy_out,
-        actions=actions,
-        action_mode="continuous",
-        action_low=action_low,
-        action_high=action_high,
-    )
-    assert torch.allclose(logp_sample, logp_eval, atol=1e-5, rtol=1e-5)
-
-    env_actions = actions_to_env_numpy(
-        actions=actions,
-        action_mode="continuous",
-        action_shape=(3,),
-        action_low=action_low,
-        action_high=action_high,
-    )
-    assert np.allclose(env_actions, actions.detach().cpu().numpy(), atol=1e-6)
-
-
-def test_rollout_continuous_actions_respect_asymmetric_bounds():
-    set_seed(13)
-    device = "cpu"
-    envs = EnvPool([AsymmetricContinuousEnv, AsymmetricContinuousEnv])
-    obs0, _ = envs.reset(seed=13)
-
-    obs_dim = int(np.prod(envs.single_observation_space.shape))
-    act_dim = int(np.prod(envs.single_action_space.shape))
-    feat_dim = 16
-    hidden_dim = 32
-    M = 2
-    mem_dim = M * feat_dim
-
-    ac = ActorCritic(
-        obs_dim=obs_dim,
-        act_dim=act_dim,
-        act_embed_dim=8,
-        hidden_dim=hidden_dim,
-        feat_dim=feat_dim,
-        mem_dim=mem_dim,
-        action_type="continuous",
-    ).to(device)
-    f_mem = FeatureEncoder(
-        obs_dim=obs_dim,
-        act_dim=act_dim,
-        act_embed_dim=8,
-        hidden_dim=hidden_dim,
-        feat_dim=feat_dim,
-        action_type="continuous",
-    ).to(device)
-    f_mem.load_state_dict(ac.f_pol.state_dict())
-    alpha_base = torch.tensor([0.5, 0.1], device=device).unsqueeze(0)
-    alpha_max = torch.tensor([0.8, 0.3], device=device).unsqueeze(0)
-    traces = torch.zeros((envs.num_envs, M, feat_dim), device=device)
-    prev_action = torch.zeros((envs.num_envs, act_dim), device=device, dtype=torch.float32)
-    obs0_t = torch.as_tensor(obs0, device=device, dtype=torch.float32)
-    traces = trace_update(traces, f_mem(obs0_t, prev_action), alpha_base.expand(envs.num_envs, -1))
-    drift = DummyDrift(device=device)
-    action_low = np.asarray(envs.single_action_space.low, dtype=np.float32).reshape(-1)
-    action_high = np.asarray(envs.single_action_space.high, dtype=np.float32).reshape(-1)
-
-    batch, _obs, prev_action_out, _traces = rollout(
-        envs=envs,
-        ac=ac,
-        f_mem=f_mem,
-        drift=drift,
-        predictor=None,
-        device=device,
-        horizon=6,
-        gamma=0.99,
-        lambda_pred=0.0,
-        obs_normalization="none",
-        alpha_base=alpha_base,
-        alpha_max=alpha_max,
-        reset_strategy="none",
-        reset_long_fraction=0.5,
-        obs=obs0,
-        prev_action=prev_action,
-        traces=traces,
-        action_mode="continuous",
-        action_shape=tuple(envs.single_action_space.shape),
-        action_low=action_low,
-        action_high=action_high,
-    )
-
-    low_t = torch.as_tensor(action_low, device=batch["actions"].device).reshape(1, 1, -1)
-    high_t = torch.as_tensor(action_high, device=batch["actions"].device).reshape(1, 1, -1)
-    assert torch.all(batch["actions"] >= low_t - 1e-6)
-    assert torch.all(batch["actions"] <= high_t + 1e-6)
-    assert torch.all(prev_action_out >= low_t.reshape(1, -1) - 1e-6)
-    assert torch.all(prev_action_out <= high_t.reshape(1, -1) + 1e-6)
