@@ -308,7 +308,7 @@ Record gameplay videos:
   --output-dir reports/gameplay
 ```
 
-Record benchmark gameplay for both checkpoints (`best` + `last`, 4 videos total with `--episodes 2`):
+Record benchmark gameplay for both checkpoints (`best_train` + `best_eval`, 4 videos total with `--episodes 2`):
 
 ```bash
 BENCH_RUN_DIR=${REPORT_DIR}/cartpole_stationary_fullobs_ppo_s0

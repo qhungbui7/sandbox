@@ -1602,7 +1602,8 @@ def train_recurrent(
     final_metrics = None
     final_checkpoint = None
     updates_completed = 0
-    best_ret50 = None
+    best_train_ret50 = None
+    best_eval_ret = None
 
     def _recurrent_checkpoint_payload(metrics: dict | None) -> dict:
         return {
@@ -1729,9 +1730,13 @@ def train_recurrent(
 
             reporter.log_metrics(metrics)
             ret50_value = finite_metric(metrics.get("train/ret50"))
-            if (ret50_value is not None) and ((best_ret50 is None) or (ret50_value > best_ret50)):
-                best_ret50 = ret50_value
-                reporter.save_checkpoint(_recurrent_checkpoint_payload(metrics), filename="checkpoint_best.pt")
+            if (ret50_value is not None) and ((best_train_ret50 is None) or (ret50_value > best_train_ret50)):
+                best_train_ret50 = ret50_value
+                reporter.save_checkpoint(_recurrent_checkpoint_payload(metrics), filename="checkpoint_best_train.pt")
+            eval_ret_value = finite_metric(metrics.get("eval/ret_mean"))
+            if (eval_ret_value is not None) and ((best_eval_ret is None) or (eval_ret_value > best_eval_ret)):
+                best_eval_ret = eval_ret_value
+                reporter.save_checkpoint(_recurrent_checkpoint_payload(metrics), filename="checkpoint_best_eval.pt")
             if mean_ret is not None:
                 log_line = (
                     f"update={upd+1:04d}  episodes={len(envs.episode_returns):06d}  "
@@ -1765,7 +1770,6 @@ def train_recurrent(
                 break
         final_payload = _recurrent_checkpoint_payload(final_metrics)
         final_checkpoint = reporter.save_checkpoint(final_payload, filename="checkpoint.pt")
-        reporter.save_checkpoint(final_payload, filename="checkpoint_last.pt")
     finally:
         profiler.close()
         if wandb_run is not None:
@@ -1948,9 +1952,9 @@ def main():
     p.add_argument(
         "--compile-mode",
         type=str,
-        default="default",
+        default="reduce-overhead",
         choices=["default", "reduce-overhead", "max-autotune"],
-        help="torch.compile mode.",
+        help="torch.compile mode (`reduce-overhead` lowers warmup/compile cost; `max-autotune` can improve long-run throughput).",
     )
     p.add_argument(
         "--torch-profiler",
@@ -2686,7 +2690,8 @@ def main():
     final_metrics = None
     final_checkpoint = None
     updates_completed = 0
-    best_ret50 = None
+    best_train_ret50 = None
+    best_eval_ret = None
 
     def _trace_checkpoint_payload(metrics: dict | None) -> dict:
         return {
@@ -3012,9 +3017,13 @@ def main():
                 final_metrics = metrics
 
             ret50_value = finite_metric(metrics.get("train/ret50"))
-            if (ret50_value is not None) and ((best_ret50 is None) or (ret50_value > best_ret50)):
-                best_ret50 = ret50_value
-                reporter.save_checkpoint(_trace_checkpoint_payload(metrics), filename="checkpoint_best.pt")
+            if (ret50_value is not None) and ((best_train_ret50 is None) or (ret50_value > best_train_ret50)):
+                best_train_ret50 = ret50_value
+                reporter.save_checkpoint(_trace_checkpoint_payload(metrics), filename="checkpoint_best_train.pt")
+            eval_ret_value = finite_metric(metrics.get("eval/ret_mean"))
+            if (eval_ret_value is not None) and ((best_eval_ret is None) or (eval_ret_value > best_eval_ret)):
+                best_eval_ret = eval_ret_value
+                reporter.save_checkpoint(_trace_checkpoint_payload(metrics), filename="checkpoint_best_eval.pt")
             if lr_scheduler is not None:
                 lr_scheduler.step()
             if progress is not None:
@@ -3031,7 +3040,6 @@ def main():
                 break
         final_payload = _trace_checkpoint_payload(final_metrics)
         final_checkpoint = reporter.save_checkpoint(final_payload, filename="checkpoint.pt")
-        reporter.save_checkpoint(final_payload, filename="checkpoint_last.pt")
     finally:
         profiler.close()
         if wandb_run is not None:
