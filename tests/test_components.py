@@ -1175,7 +1175,7 @@ def test_cnn_encoder_forward_cpu():
         obs_shape=obs_shape,
     ).to(device)
     prev_action = torch.zeros(batch, device=device, dtype=torch.int64)
-    obs = torch.zeros((batch, *obs_shape), device=device, dtype=torch.float32)
+    obs = torch.zeros((batch, obs_shape[2], obs_shape[0], obs_shape[1]), device=device, dtype=torch.float32)
     traces = torch.zeros((batch, mem_dim), device=device, dtype=torch.float32)
     logits, value = ac(obs, prev_action, traces)
     assert logits.shape == (batch, act_dim)

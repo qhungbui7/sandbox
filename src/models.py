@@ -46,8 +46,8 @@ class ConvEncoder(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         if obs.ndim != 4:
-            raise ValueError(f"CNN encoder expects obs [B,H,W,C], got shape={tuple(obs.shape)}")
-        x = obs.permute(0, 3, 1, 2).contiguous().float()
+            raise ValueError(f"CNN encoder expects obs [B,C,H,W], got shape={tuple(obs.shape)}")
+        x = obs
         x = self.conv(x)
         x = x.reshape(x.shape[0], -1)
         return self.head(x)

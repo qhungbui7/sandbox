@@ -79,17 +79,37 @@ def _imagenet_stats(num_channels: int, *, like: torch.Tensor) -> tuple[torch.Ten
     return base_mean.repeat(repeats)[:num_channels], base_std.repeat(repeats)[:num_channels]
 
 
+def _is_channel_last_image_shape(shape: tuple[int, ...]) -> bool:
+    if len(shape) == 3:
+        h, w, c = shape
+        return h > 0 and w > 0 and c > 0
+    if len(shape) == 4:
+        _b, h, w, c = shape
+        return h > 0 and w > 0 and c > 0
+    return False
+
+
+def _to_channel_first_if_image(obs: torch.Tensor) -> torch.Tensor:
+    if not _is_channel_last_image_shape(tuple(int(x) for x in obs.shape)):
+        return obs
+    if obs.ndim == 3:
+        return obs.permute(2, 0, 1).contiguous()
+    if obs.ndim == 4:
+        return obs.permute(0, 3, 1, 2).contiguous()
+    return obs
+
+
 def obs_to_tensor(obs, *, device: str, obs_normalization: str = "auto") -> torch.Tensor:
     mode = str(obs_normalization).strip().lower()
     if mode not in {"auto", "none", "uint8", "imagenet"}:
         raise ValueError(f"Unsupported obs normalization mode: {obs_normalization}")
     source_dtype = getattr(obs, "dtype", None)
-    out = torch.as_tensor(obs, device=device, dtype=torch.float32)
+    out = torch.as_tensor(obs, dtype=torch.float32)
     if mode == "none":
-        return out
-    if mode == "uint8":
-        return out / 255.0
-    if mode == "imagenet":
+        pass
+    elif mode == "uint8":
+        out = out / 255.0
+    elif mode == "imagenet":
         if out.ndim < 3:
             raise ValueError(
                 "`obs_normalization=imagenet` expects image observations with a channel-last axis "
@@ -101,7 +121,17 @@ def obs_to_tensor(obs, *, device: str, obs_normalization: str = "auto") -> torch
         mean, std = _imagenet_stats(channels, like=out)
         shape = [1] * out.ndim
         shape[-1] = channels
-        return (out - mean.view(*shape)) / std.view(*shape)
-    if _is_uint8_dtype(source_dtype):
-        return out / 255.0
-    return out
+        out = (out - mean.view(*shape)) / std.view(*shape)
+    elif _is_uint8_dtype(source_dtype):
+        out = out / 255.0
+
+    out = _to_channel_first_if_image(out)
+
+    target_device = torch.device(device)
+    if out.device == target_device:
+        return out
+    if target_device.type == "cuda" and out.device.type == "cpu":
+        if not out.is_pinned():
+            out = out.pin_memory()
+        return out.to(target_device, non_blocking=True)
+    return out.to(target_device)
