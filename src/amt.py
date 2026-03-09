@@ -226,7 +226,8 @@ def rollout(
         xmem_next_buf = None
         long_mask = None
 
-    obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
+    obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
+    obs_buf = torch.zeros((horizon, *obs_t.shape), device=device)
     if str(action_mode) == "continuous":
         act_dim = int(prev_action.shape[-1]) if prev_action is not None else int(np.prod(action_shape))
         prev_a_buf = (
@@ -247,7 +248,6 @@ def rollout(
     reset_buf = torch.zeros((horizon, n_envs), device=device, dtype=torch.bool)
 
     for t in range(horizon):
-        obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
         if prev_a_buf is not None and prev_action is not None:
             prev_a_buf[t] = prev_action
@@ -352,8 +352,9 @@ def rollout(
 
         prev_action = next_prev_action
         obs = next_obs
+        obs_t = next_obs_t
 
-    obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
+    obs_T = obs_t
     traces_flat_T = traces.reshape(n_envs, -1) if use_traces and traces is not None else None
     _policy_out_T, value_T = ac(obs_T, prev_action, traces_flat_T)
 
@@ -399,7 +400,8 @@ def rollout_recurrent(
     use_prev_action = bool(getattr(getattr(ac, "f_pol", None), "use_prev_action", True))
     if not use_prev_action:
         prev_action = None
-    obs_buf = torch.zeros((horizon, n_envs, *obs.shape[1:]), device=device)
+    obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
+    obs_buf = torch.zeros((horizon, *obs_t.shape), device=device)
     if str(action_mode) == "continuous":
         act_dim = int(prev_action.shape[-1]) if prev_action is not None else int(np.prod(action_shape))
         prev_a_buf = (
@@ -422,7 +424,6 @@ def rollout_recurrent(
     h0, c0 = h.clone(), c.clone()
 
     for t in range(horizon):
-        obs_t = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
         obs_buf[t] = obs_t
         if prev_a_buf is not None and prev_action is not None:
             prev_a_buf[t] = prev_action
@@ -451,6 +452,7 @@ def rollout_recurrent(
         done_buf[t] = torch.as_tensor(done, device=device, dtype=torch.bool)
         term_buf[t] = torch.as_tensor(terminated, device=device, dtype=torch.bool)
         trunc_buf[t] = torch.as_tensor(truncated, device=device, dtype=torch.bool)
+        next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
 
         # Time-limit handling: bootstrap from the final pre-reset observation.
         if np.any(truncated):
@@ -486,8 +488,9 @@ def rollout_recurrent(
 
         prev_action = next_prev_action
         obs = next_obs
+        obs_t = next_obs_t
 
-    obs_T = obs_to_tensor(obs, device=device, obs_normalization=obs_normalization)
+    obs_T = obs_t
     # Bootstrap value at obs_T without advancing the carried recurrent state.
     _policy_out_T, value_T, _ = ac(obs_T, prev_action, (h, c))
 

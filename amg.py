@@ -804,7 +804,8 @@ def validate_encoder_optimization_path(
         obs_shape = getattr(model_base.f_pol, "obs_shape", None)
         if obs_shape is None:
             raise RuntimeError("Encoder check failed: CNN encoder requires `obs_shape`.")
-        obs_probe = torch.zeros((2, *obs_shape), device=device, dtype=torch.float32)
+        h, w, c = (int(obs_shape[0]), int(obs_shape[1]), int(obs_shape[2]))
+        obs_probe = torch.zeros((2, c, h, w), device=device, dtype=torch.float32)
     else:
         first = getattr(model_base.f_pol.obs_encoder, "net", [None])[0]
         obs_dim = int(getattr(first, "in_features", 0))
