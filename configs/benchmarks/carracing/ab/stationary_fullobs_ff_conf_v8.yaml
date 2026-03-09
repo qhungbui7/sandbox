@@ -22,7 +22,7 @@ overrides:
     num_envs: 8
     env_workers: 2
     horizon: 256
-    total_steps: 5001216 # 102400 # 5001216
+    total_steps: 102400 # 1001472 # 5001216 # 102400 # 5001216
     epochs: 8
     ent_coef: 1e-3
     vf_coef: 0.75

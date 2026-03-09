@@ -160,8 +160,10 @@ def _load_checkpoint(checkpoint: str | None, run_dir: str | None, device: str) -
 
 
 def _resolve_checkpoint_for_kind(run_dir: Path, checkpoint_kind: str) -> Path:
-    if checkpoint_kind == "best":
-        candidates = [run_dir / "checkpoint_best.pt", run_dir / "checkpoint.pt"]
+    if checkpoint_kind in {"best_train", "best"}:
+        candidates = [run_dir / "checkpoint_best_train.pt", run_dir / "checkpoint_best.pt", run_dir / "checkpoint.pt"]
+    elif checkpoint_kind == "best_eval":
+        candidates = [run_dir / "checkpoint_best_eval.pt", run_dir / "checkpoint.pt"]
     elif checkpoint_kind == "last":
         candidates = [run_dir / "checkpoint_last.pt", run_dir / "checkpoint.pt"]
     else:
@@ -262,7 +264,7 @@ def record_benchmark_run_gameplays(
     video_length: int,
     overwrite: bool,
 ) -> None:
-    kinds = ["best", "last"] if checkpoint_kind == "both" else [checkpoint_kind]
+    kinds = ["best_train", "best_eval"] if checkpoint_kind == "both" else [checkpoint_kind]
     base_name = name or run_dir.name
     generated = 0
     seen_checkpoint_paths: set[Path] = set()
@@ -327,7 +329,7 @@ def record_benchmark_run_gameplays(
     if generated == 0:
         raise SystemExit(
             f"No gameplay generated from run dir: {run_dir}. "
-            "Expected at least one of: checkpoint_best.pt, checkpoint_last.pt, checkpoint.pt"
+            "Expected at least one of: checkpoint_best_train.pt, checkpoint_best_eval.pt, checkpoint_best.pt, checkpoint.pt"
         )
 
 
@@ -794,9 +796,9 @@ def main() -> None:
     p.add_argument(
         "--checkpoint-kind",
         type=str,
-        default="last",
-        choices=["last", "best", "both"],
-        help="Checkpoint selection when --run-dir is provided. `both` records best + last.",
+        default="best_train",
+        choices=["best_train", "best_eval", "best", "last", "both"],
+        help="Checkpoint selection when --run-dir is provided. `both` records best_train + best_eval.",
     )
     default_device = os.environ.get("AMT_DEVICE") or os.environ.get("DEVICE") or "cuda"
     p.add_argument("--device", type=str, default=default_device)
@@ -858,7 +860,9 @@ def main() -> None:
         )
     device = resolve_device(args.device, args.cuda_id)
     if args.checkpoint is not None and args.checkpoint_kind == "both":
-        raise ValueError("`--checkpoint-kind both` requires `--run-dir` so best/last checkpoints can be resolved.")
+        raise ValueError(
+            "`--checkpoint-kind both` requires `--run-dir` so best_train/best_eval checkpoints can be resolved."
+        )
 
     # Headless servers may not have an audio device; keep rendering silent.
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")

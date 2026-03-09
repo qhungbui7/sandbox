@@ -96,7 +96,7 @@ export REPORT_DIR=reports/benchmarks
 | `--carracing-downsample`, `--carracing-grayscale` | Optional CarRacing observation preprocessing to reduce input size. |
 | `--frame-stack` | Stack last K observations along channel/last axis (recommended with `--encoder cnn`). |
 | `--debug-log` | Enable extra per-update PPO debug diagnostics in `metrics.jsonl`/W&B. |
-| `--tf32`, `--adam-fused`, `--compile` | CUDA speed knobs (use `--no-tf32` / `--no-adam-fused` to disable). |
+| `--tf32`, `--adam-fused`, `--compile`, `--compile-mode` | CUDA speed knobs (`--compile-mode reduce-overhead` is lower warmup overhead; `max-autotune` may win on long runs). |
 
 ## Modular config layout
 
