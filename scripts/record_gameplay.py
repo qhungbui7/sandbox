@@ -264,13 +264,27 @@ def record_benchmark_run_gameplays(
 ) -> None:
     kinds = ["best", "last"] if checkpoint_kind == "both" else [checkpoint_kind]
     base_name = name or run_dir.name
+    generated = 0
+    seen_checkpoint_paths: set[Path] = set()
     for kind in kinds:
-        checkpoint_path = _resolve_checkpoint_for_kind(run_dir=run_dir, checkpoint_kind=kind)
-        payload, _ = _load_checkpoint(checkpoint=str(checkpoint_path), run_dir=None, device=device)
-        suffix = f"_{kind}" if len(kinds) > 1 else ""
-        run_name = f"{base_name}{suffix}"
-        video_dir = _resolve_output_video_dir(base_dir=output_dir, run_name=run_name, overwrite=overwrite)
         try:
+            checkpoint_path = _resolve_checkpoint_for_kind(run_dir=run_dir, checkpoint_kind=kind)
+        except FileNotFoundError as exc:
+            if len(kinds) > 1:
+                print(f"[warn] skipping `{kind}`: {exc}")
+                continue
+            raise
+
+        if checkpoint_path in seen_checkpoint_paths:
+            print(f"[warn] skipping `{kind}`: duplicate checkpoint path {checkpoint_path}")
+            continue
+        seen_checkpoint_paths.add(checkpoint_path)
+
+        try:
+            payload, _ = _load_checkpoint(checkpoint=str(checkpoint_path), run_dir=None, device=device)
+            suffix = f"_{kind}" if len(kinds) > 1 else ""
+            run_name = f"{base_name}{suffix}"
+            video_dir = _resolve_output_video_dir(base_dir=output_dir, run_name=run_name, overwrite=overwrite)
             returns, lengths = _run_policy_recording(
                 payload=payload,
                 device=device,
@@ -286,10 +300,18 @@ def record_benchmark_run_gameplays(
                 record_all_episodes=record_all_episodes,
                 video_length=video_length,
             )
-        except RuntimeError as exc:
-            raise SystemExit(str(exc)) from exc
+        except Exception as exc:
+            if len(kinds) > 1:
+                print(f"[warn] skipping `{kind}` due to recording error: {exc}")
+                continue
+            if isinstance(exc, RuntimeError):
+                raise SystemExit(str(exc)) from exc
+            raise
         videos = sorted(video_dir.glob("*.mp4"))
         if not videos:
+            if len(kinds) > 1:
+                print(f"[warn] skipping `{kind}`: no videos generated in {video_dir}")
+                continue
             raise SystemExit(f"No videos generated in {video_dir}")
         mean_ret = sum(returns) / max(len(returns), 1)
         mean_len = sum(lengths) / max(len(lengths), 1)
@@ -300,6 +322,13 @@ def record_benchmark_run_gameplays(
         print(f"[{kind}] mean return={mean_ret:.3f}, mean length={mean_len:.2f}")
         for video in videos:
             print(video)
+        generated += 1
+
+    if generated == 0:
+        raise SystemExit(
+            f"No gameplay generated from run dir: {run_dir}. "
+            "Expected at least one of: checkpoint_best.pt, checkpoint_last.pt, checkpoint.pt"
+        )
 
 
 def _make_eval_env(
@@ -556,8 +585,6 @@ def _record_feedforward(
                     policy_out=policy_out,
                     action_mode=action_mode,
                     deterministic=deterministic,
-                    action_low=action_low,
-                    action_high=action_high,
                 )
                 env_action = actions_to_env_numpy(
                     actions=action,
@@ -722,8 +749,6 @@ def _record_recurrent(
                     policy_out=policy_out,
                     action_mode=action_mode,
                     deterministic=deterministic,
-                    action_low=action_low,
-                    action_high=action_high,
                 )
                 env_action = actions_to_env_numpy(
                     actions=action,
