@@ -270,6 +270,7 @@ def ppo_update_recurrent(
     use_amp: bool,
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
+    minibatch_size: int | None = None,
     debug_cfg: dict | None = None,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
@@ -288,8 +289,11 @@ def ppo_update_recurrent(
     adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
     T, N = rewards.shape
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+    envs_per_minibatch = int(N)
+    if minibatch_size is not None:
+        envs_per_minibatch = max(1, int(minibatch_size) // max(int(T), 1))
+        envs_per_minibatch = min(int(N), envs_per_minibatch)
 
-    env_idx = torch.arange(N, device=obs.device)
     sum_policy = torch.zeros((), device=obs.device)
     sum_value = torch.zeros((), device=obs.device)
     sum_entropy = torch.zeros((), device=obs.device)
@@ -365,10 +369,14 @@ def ppo_update_recurrent(
     stop_due_to_kl = False
     kl_early_stop = target_kl > 0.0
     for _ in range(epochs):
-        perm_env = env_idx[torch.randperm(N, generator=generator, device=env_idx.device)]
-        for env_id in perm_env:
-            h = h0[:, env_id : env_id + 1].detach()
-            c = c0[:, env_id : env_id + 1].detach()
+        perm_env = torch.randperm(N, generator=generator, device=obs.device)
+        for start in range(0, N, envs_per_minibatch):
+            env_ids = perm_env[start : start + envs_per_minibatch]
+            if env_ids.numel() == 0:
+                continue
+            env_weight = int(env_ids.numel())
+            h = h0.index_select(1, env_ids).detach()
+            c = c0.index_select(1, env_ids).detach()
 
             traj_logp = []
             traj_values = []
@@ -377,9 +385,10 @@ def ppo_update_recurrent(
 
             for t in range(T):
                 with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                    prev_a_t = prev_a[t, env_id : env_id + 1] if prev_a is not None else None
-                    policy_out, value, (h, c) = ac(obs[t, env_id : env_id + 1], prev_a_t, (h, c))
-                    action_t = actions[t, env_id : env_id + 1]
+                    obs_t = obs[t].index_select(0, env_ids)
+                    prev_a_t = prev_a[t].index_select(0, env_ids) if prev_a is not None else None
+                    policy_out, value, (h, c) = ac(obs_t, prev_a_t, (h, c))
+                    action_t = actions[t].index_select(0, env_ids)
                     logp_t, entropy_t, max_prob_t = evaluate_policy_actions(
                         policy_out=policy_out,
                         actions=action_t,
@@ -391,27 +400,32 @@ def ppo_update_recurrent(
                     traj_entropy.append(entropy_t)
                     if debug_enabled:
                         traj_max_action_prob.append(max_prob_t)
-                done_t = dones[t, env_id].to(dtype=h.dtype)
+                done_t = dones[t].index_select(0, env_ids).to(dtype=h.dtype).view(1, -1, 1)
                 h = h * (1.0 - done_t)
                 c = c * (1.0 - done_t)
 
-            values_all = torch.cat(traj_values, dim=0).squeeze(-1)
+            values_all = torch.stack(traj_values, dim=0).squeeze(-1)
             logp_all = torch.stack(traj_logp, dim=0)
             entropy = torch.stack(traj_entropy, dim=0).mean()
 
-            log_ratio = logp_all - logp_old[:, env_id]
+            logp_old_mb = logp_old.index_select(1, env_ids)
+            adv_mb = adv.index_select(1, env_ids)
+            returns_mb = returns.index_select(1, env_ids)
+            values_old_mb = values_old.index_select(1, env_ids)
+
+            log_ratio = logp_all - logp_old_mb
             ratio = log_ratio.exp()
-            pg1 = ratio * adv[:, env_id]
-            pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv[:, env_id]
+            pg1 = ratio * adv_mb
+            pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_mb
             policy_loss = -torch.min(pg1, pg2).mean()
             if vf_clip:
-                value_delta = values_all - values_old[:, env_id]
-                values_clipped = values_old[:, env_id] + torch.clamp(value_delta, -clip_coef, clip_coef)
-                value_err = (returns[:, env_id] - values_all).pow(2)
-                value_err_clipped = (returns[:, env_id] - values_clipped).pow(2)
+                value_delta = values_all - values_old_mb
+                values_clipped = values_old_mb + torch.clamp(value_delta, -clip_coef, clip_coef)
+                value_err = (returns_mb - values_all).pow(2)
+                value_err_clipped = (returns_mb - values_clipped).pow(2)
                 value_loss = 0.5 * torch.maximum(value_err, value_err_clipped).mean()
             else:
-                value_loss = 0.5 * (returns[:, env_id] - values_all).pow(2).mean()
+                value_loss = 0.5 * (returns_mb - values_all).pow(2).mean()
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
 
             global_grad_norm, module_grad_norms = _step_optimizer_recurrent(
@@ -424,26 +438,27 @@ def ppo_update_recurrent(
             )
 
             with torch.no_grad():
-                approx_kl = (logp_old[:, env_id] - logp_all).mean()
+                approx_kl = (logp_old_mb - logp_all).mean()
                 kl_for_stop = (ratio - 1.0 - log_ratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
-                sum_policy = sum_policy + policy_loss.detach().float()
-                sum_value = sum_value + value_loss.detach().float()
-                sum_entropy = sum_entropy + entropy.detach().float()
-                sum_approx_kl = sum_approx_kl + approx_kl.detach().float()
-                sum_clipfrac = sum_clipfrac + clipfrac.detach().float()
-                mb_count += 1
+                weight_t = policy_loss.detach().float().new_tensor(float(env_weight))
+                sum_policy = sum_policy + policy_loss.detach().float() * weight_t
+                sum_value = sum_value + value_loss.detach().float() * weight_t
+                sum_entropy = sum_entropy + entropy.detach().float() * weight_t
+                sum_approx_kl = sum_approx_kl + approx_kl.detach().float() * weight_t
+                sum_clipfrac = sum_clipfrac + clipfrac.detach().float() * weight_t
+                mb_count += env_weight
 
                 if debug_enabled:
-                    sum_total = sum_total + loss.detach().float()
+                    sum_total = sum_total + loss.detach().float() * weight_t
                     max_approx_kl = torch.maximum(max_approx_kl, approx_kl.detach().float())
-                    sum_max_action_prob = sum_max_action_prob + torch.stack(traj_max_action_prob, dim=0).mean()
-                    sum_grad_global = sum_grad_global + global_grad_norm
+                    sum_max_action_prob = sum_max_action_prob + torch.stack(traj_max_action_prob, dim=0).mean() * weight_t
+                    sum_grad_global = sum_grad_global + global_grad_norm * weight_t
                     max_grad_global = torch.maximum(max_grad_global, global_grad_norm)
-                    sum_grad_encoder = sum_grad_encoder + module_grad_norms["encoder"]
-                    sum_grad_core = sum_grad_core + module_grad_norms["core"]
-                    sum_grad_pi = sum_grad_pi + module_grad_norms["pi"]
-                    sum_grad_v = sum_grad_v + module_grad_norms["v"]
+                    sum_grad_encoder = sum_grad_encoder + module_grad_norms["encoder"] * weight_t
+                    sum_grad_core = sum_grad_core + module_grad_norms["core"] * weight_t
+                    sum_grad_pi = sum_grad_pi + module_grad_norms["pi"] * weight_t
+                    sum_grad_v = sum_grad_v + module_grad_norms["v"] * weight_t
                     ratio_filled = _update_tensor_reservoir(
                         ratio_reservoir,
                         ratio_filled,

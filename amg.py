@@ -1663,6 +1663,7 @@ def train_recurrent(
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 grad_scaler=grad_scaler,
+                minibatch_size=args.minibatch_size,
                 debug_cfg=ppo_debug_cfg,
             )
 
