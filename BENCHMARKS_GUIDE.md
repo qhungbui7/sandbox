@@ -19,7 +19,7 @@ Now it also supports:
 3. `nonstationary_fullobs`
 4. `nonstationary_partialobs`
 
-for three classic-control environments:
+for three classic-control environments plus one pixel-control environment:
 
 1. `CartPole-v1`
 2. `Acrobot-v1`

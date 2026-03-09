@@ -74,7 +74,7 @@ for algo in ppo a2c trpo reinforce v-trace v-mpo dqn; do
     --run-note "single-task sweep algo=${algo} stationary cartpole" \
     --device cuda \
     --cuda-id ${GPU_ID} \
-    --total-steps 10000 \
+    --total-steps 10240 \
     --wandb \
     --wandb-project ${WANDB_PROJECT} \
     --wandb-entity ${WANDB_ENTITY} \
@@ -311,8 +311,10 @@ Record gameplay videos:
 Record benchmark gameplay for both checkpoints (`best` + `last`, 4 videos total with `--episodes 2`):
 
 ```bash
+BENCH_RUN_DIR=${REPORT_DIR}/cartpole_stationary_fullobs_ppo_s0
+
 .venv/bin/python scripts/record_gameplay.py \
-  --run-dir /raid/nobackup/trustvision/hungbui/workspace/per/amt/reports/benchmarks/ab_stationary_fullobs_recurrent_conf_4_bigger_ppo_s0_vfclip-ab-stablized-complex-discrete-joystick-long-grayscale-downscale \
+  --run-dir ${BENCH_RUN_DIR} \
   --checkpoint-kind both \
   --episodes 2 \
   --device cuda \

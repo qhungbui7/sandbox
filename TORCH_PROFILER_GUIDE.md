@@ -19,7 +19,7 @@ Default output directory:
 Run a short profiling job first:
 
 ```bash
-python3 amg.py configs/benchmarks/cartpole/stationary_fullobs.yaml \
+.venv/bin/python amg.py configs/benchmarks/cartpole/stationary_fullobs.yaml \
   --run-note "torch profiler quick check" \
   --device cuda \
   --cuda-id 0 \
