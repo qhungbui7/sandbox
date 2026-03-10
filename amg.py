@@ -1240,6 +1240,8 @@ def evaluate_trace_policy(
                 policy_out=policy_out,
                 action_mode=action_mode,
                 deterministic=bool(args.algo == "dqn" or deterministic),
+                action_low=action_low,
+                action_high=action_high,
             )
             env_action = actions_to_env_numpy(
                 actions=action,
@@ -1425,6 +1427,8 @@ def evaluate_recurrent_policy(
                 policy_out=policy_out,
                 action_mode=action_mode,
                 deterministic=bool(deterministic),
+                action_low=action_low,
+                action_high=action_high,
             )
             env_action = actions_to_env_numpy(
                 actions=action,
@@ -1666,6 +1670,8 @@ def train_recurrent(
                 grad_scaler=grad_scaler,
                 minibatch_size=args.minibatch_size,
                 debug_cfg=ppo_debug_cfg,
+                action_low=action_low,
+                action_high=action_high,
             )
 
             metrics = {
@@ -2781,6 +2787,8 @@ def main():
                     vmpo_kl_coef=args.vmpo_kl_coef,
                     vmpo_kl_target=args.vmpo_kl_target,
                     debug_cfg=ppo_debug_cfg,
+                    action_low=action_low,
+                    action_high=action_high,
                 )
                 if f_mem is not None:
                     ema_update_(f_mem, ac.f_pol, tau=args.ema_tau)

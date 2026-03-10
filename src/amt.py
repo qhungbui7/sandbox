@@ -260,6 +260,8 @@ def rollout(
             policy_out=policy_out,
             action_mode=action_mode,
             deterministic=False,
+            action_low=action_low,
+            action_high=action_high,
         )
 
         act_buf[t] = action
@@ -433,6 +435,8 @@ def rollout_recurrent(
             policy_out=policy_out,
             action_mode=action_mode,
             deterministic=False,
+            action_low=action_low,
+            action_high=action_high,
         )
         act_buf[t] = action
         logp_buf[t] = logp
