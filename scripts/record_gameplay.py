@@ -587,6 +587,8 @@ def _record_feedforward(
                     policy_out=policy_out,
                     action_mode=action_mode,
                     deterministic=deterministic,
+                    action_low=action_low,
+                    action_high=action_high,
                 )
                 env_action = actions_to_env_numpy(
                     actions=action,
@@ -751,6 +753,8 @@ def _record_recurrent(
                     policy_out=policy_out,
                     action_mode=action_mode,
                     deterministic=deterministic,
+                    action_low=action_low,
+                    action_high=action_high,
                 )
                 env_action = actions_to_env_numpy(
                     actions=action,
