@@ -1,0 +1,40 @@
+name: amt
+
+x-common-env: &common-env
+  PYTHONUNBUFFERED: "1"
+  MPLBACKEND: Agg
+  SDL_VIDEODRIVER: dummy
+  WANDB_DIR: /workspace/wandb
+  WANDB_MODE: ${WANDB_MODE:-offline}
+
+x-amt-service: &amt-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: amt:dev
+  working_dir: /workspace
+  volumes:
+    - .:/workspace
+  stdin_open: true
+  tty: true
+  command: ["amg.py", "--help"]
+
+services:
+  app:
+    <<: *amt-service
+    environment:
+      <<: *common-env
+      AMT_DEVICE: ${AMT_DEVICE:-cpu}
+
+  app-gpu:
+    <<: *amt-service
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+    environment:
+      <<: *common-env
+      AMT_DEVICE: cuda

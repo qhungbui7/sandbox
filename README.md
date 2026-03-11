@@ -7,6 +7,7 @@ Adaptive Memory Traces (AMT) is a compact research playground that tests how wel
 - [`COMMANDS_TO_RUN.md`](COMMANDS_TO_RUN.md): all copy/paste commands (setup, training, benchmark matrix, plots, gameplay, baseline QA, paper sweeps).
 - [`BENCHMARKS_GUIDE.md`](BENCHMARKS_GUIDE.md): what the benchmark regimes/algorithms mean (beginner friendly).
 - [`EXAMPLE_USE_ALL_UTILITIES.md`](EXAMPLE_USE_ALL_UTILITIES.md): one-command end-to-end smoke run using the repo utilities.
+- [`DOCKER.md`](DOCKER.md): containerized setup (CPU/GPU) for reproducible runs.
 - [`BASELINE_QA_GUIDE.md`](BASELINE_QA_GUIDE.md): baseline-only questionnaire workflow (PPO-FF + answer sheet generator).
 - [`PAPER.md`](PAPER.md): paper-style overview and experiment plan.
 
@@ -24,6 +25,7 @@ Each of these components lives in `amg.py`, so you can trace data flow without j
 ## Environment & dependency setup
 
 See [`INSTALL.md`](INSTALL.md) for the one-time virtualenv + dependency setup.
+For containerized reproducibility, use [`DOCKER.md`](DOCKER.md).
 
 > *Note:* Install a CUDA-enabled PyTorch build if you plan to use GPUs or mixed precision.
 
