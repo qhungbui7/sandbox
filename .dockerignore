@@ -1,0 +1,21 @@
+.git
+.cache
+.pytest_cache
+.venv
+.vscode
+__pycache__/
+*.py[cod]
+
+# Local runtime artifacts
+.env
+artifacts/
+logs/
+reports/
+wandb/
+*.log
+bench*.log
+nohup.out
+
+# Not required in image build context
+analytics.ipynb
+data.ipynb
