@@ -226,3 +226,5 @@ artifacts/
 plots
 paper
 .hiding
+.claude
+CLAUDE.md
