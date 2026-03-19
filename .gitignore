@@ -213,9 +213,9 @@ __marimo__/
 wandb
 *.pdf
 
-reports/
+# reports/
 reports/dev
-reports/plots
+# reports/plots
 reports/gameplay
 reports/analysis
 *.pt
@@ -228,3 +228,8 @@ paper
 .hiding
 .claude
 CLAUDE.md
+# *.csv
+*.jsonl
+*.mp4
+reports/benchmarks
+reports/example

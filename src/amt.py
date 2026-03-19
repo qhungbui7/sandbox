@@ -91,8 +91,8 @@ class DriftMonitor:
 
         d = (s.e_s - s.e_l) / (s.e_l + self.eps)
 
+        var_next = (1.0 - self.beta) * s.var + self.beta * (d - s.mu).pow(2)
         mu_next = (1.0 - self.beta) * s.mu + self.beta * d
-        var_next = (1.0 - self.beta) * s.var + self.beta * (d - mu_next).pow(2)
         s.mu = mu_next
         s.var = var_next
 
@@ -275,7 +275,7 @@ def rollout(
             action_low=action_low,
             action_high=action_high,
         )
-        next_obs, reward, terminated, truncated, _ = envs.step(env_action)
+        next_obs, reward, terminated, truncated, infos = envs.step(env_action)
         done_env = terminated | truncated
 
         rew = torch.as_tensor(reward, device=device, dtype=torch.float32)
@@ -286,6 +286,28 @@ def rollout(
         term_buf[t] = term
         trunc_buf[t] = trunc
         done_buf[t] = done
+
+        if np.any(truncated):
+            boot_obs = np.asarray(next_obs).copy()
+            for env_idx, tr in enumerate(truncated.tolist()):
+                if not tr:
+                    continue
+                info_i = infos[env_idx] if env_idx < len(infos) else None
+                if isinstance(info_i, dict) and ("final_obs" in info_i):
+                    boot_obs[env_idx] = np.asarray(info_i["final_obs"])
+            trunc_idx_np = np.flatnonzero(truncated)
+            trunc_idx = torch.as_tensor(trunc_idx_np, device=device, dtype=torch.long)
+            boot_obs_t = obs_to_tensor(
+                boot_obs[trunc_idx_np], device=device, obs_normalization=obs_normalization,
+            )
+            prev_action_boot = action[trunc_idx] if use_prev_action else None
+            traces_boot = None
+            if use_traces and traces is not None and f_mem is not None:
+                x_mem_boot = encode_mem(f_mem, obs_t, prev_action)
+                traces_updated = trace_update(traces, x_mem_boot, alpha_base.expand(n_envs, -1))
+                traces_boot = traces_updated[trunc_idx].reshape(trunc_idx_np.shape[0], -1)
+            _, v_timeout = ac(boot_obs_t, prev_action_boot, traces_boot)
+            rew_buf[t, trunc_idx] = rew_buf[t, trunc_idx] + gamma * v_timeout
 
         next_obs_t = obs_to_tensor(next_obs, device=device, obs_normalization=obs_normalization)
         if use_prev_action:

@@ -3,35 +3,9 @@ import torch.nn as nn
 import numpy as np
 
 from src.action_utils import evaluate_policy_actions
-from src.models import ActorCritic, Predictor, RecurrentActorCritic
+from src.algorithms import compute_gae
+from src.models import RecurrentActorCritic
 from src.utils import autocast_context
-
-
-def compute_gae(
-    rewards: torch.Tensor,
-    dones: torch.Tensor,
-    resets: torch.Tensor,
-    values: torch.Tensor,
-    last_value: torch.Tensor,
-    gamma: float,
-    lam: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    rewards, dones, resets, values: (T, N)
-    last_value: (N,)
-    """
-    T, N = rewards.shape
-    adv = torch.zeros((T, N), device=rewards.device)
-    last_gae = torch.zeros(N, device=rewards.device)
-    for t in reversed(range(T)):
-        next_value = last_value if t == T - 1 else values[t + 1]
-        nonterminal = (~dones[t]).float()
-        trunc = (~resets[t]).float()
-        delta = rewards[t] + gamma * nonterminal * trunc * next_value - values[t]
-        last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
-        adv[t] = last_gae
-    returns = adv + values
-    return adv, returns
 
 
 def _step_optimizer_recurrent(
@@ -43,12 +17,13 @@ def _step_optimizer_recurrent(
     max_grad_norm: float,
     grad_modules: dict[str, nn.Module] | None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    all_params = [p for group in opt.param_groups for p in group["params"]]
     module_norms: dict[str, torch.Tensor] = {}
     opt.zero_grad(set_to_none=True)
     if grad_scaler is not None and grad_scaler.is_enabled():
         grad_scaler.scale(loss).backward()
         grad_scaler.unscale_(opt)
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        global_norm = nn.utils.clip_grad_norm_(all_params, max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -60,7 +35,7 @@ def _step_optimizer_recurrent(
         grad_scaler.update()
     else:
         loss.backward()
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        global_norm = nn.utils.clip_grad_norm_(all_params, max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -100,161 +75,6 @@ def _update_tensor_reservoir(
     select = torch.randperm(int(merged.numel()), generator=generator, device=merged.device)[:capacity]
     reservoir[:] = merged[select]
     return capacity
-
-
-def ppo_update(
-    ac: ActorCritic,
-    opt: torch.optim.Optimizer,
-    batch: dict,
-    clip_coef: float,
-    vf_clip: bool,
-    target_kl: float,
-    vf_coef: float,
-    max_grad_norm: float,
-    ent_coef: float,
-    epochs: int,
-    minibatch_size: int,
-    lam: float,
-    gamma: float,
-    pred: Predictor | None,
-    pred_coef: float,
-    generator: torch.Generator,
-    device: str,
-    use_amp: bool,
-    amp_dtype: torch.dtype,
-    grad_scaler: torch.amp.GradScaler | None,
-    action_low: np.ndarray | None = None,
-    action_high: np.ndarray | None = None,
-) -> dict[str, float]:
-    action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
-    obs = batch["obs"]
-    prev_a = batch.get("prev_action", None)
-    traces = batch.get("traces", None)
-    actions = batch["actions"]
-    logp_old = batch["logp_old"]
-    values_old = batch["values_old"]
-    rewards = batch["rewards"]
-    dones = batch["dones"]
-    resets = batch["resets"]
-    value_T = batch["value_T"]
-    x_mem = batch["x_mem"]
-    x_mem_next = batch["x_mem_next"]
-
-    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
-
-    T, N = rewards.shape
-    b = T * N
-
-    obs_f = obs.reshape((b, *obs.shape[2:]))
-    if prev_a is None:
-        prev_a_f = None
-    elif prev_a.ndim == 2:
-        prev_a_f = prev_a.reshape(b)
-    else:
-        prev_a_f = prev_a.reshape(b, -1)
-    traces_f = traces.reshape(b, -1) if traces is not None else None
-    if actions.ndim == 2:
-        actions_f = actions.reshape(b)
-    else:
-        actions_f = actions.reshape(b, -1)
-    logp_old_f = logp_old.reshape(b)
-    values_old_f = values_old.reshape(b)
-    adv_f = adv.reshape(b)
-    returns_f = returns.reshape(b)
-    x_mem_f = x_mem.reshape(b, -1) if x_mem is not None else None
-    x_mem_next_f = x_mem_next.reshape(b, -1) if x_mem_next is not None else None
-
-    adv_f = (adv_f - adv_f.mean()) / (adv_f.std(unbiased=False) + 1e-8)
-
-    idx = torch.arange(b, device=obs.device)
-    stats = {
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "pred_loss": 0.0,
-        "approx_kl": 0.0,
-        "clipfrac": 0.0,
-        "count": 0.0,
-    }
-    stop_due_to_kl = False
-    kl_early_stop = target_kl > 0.0
-    for _ in range(epochs):
-        perm = idx[torch.randperm(b, generator=generator, device=idx.device)]
-        for start in range(0, b, minibatch_size):
-            mb = perm[start : start + minibatch_size]
-
-            with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                prev_a_mb = prev_a_f[mb] if prev_a_f is not None else None
-                traces_mb = traces_f[mb] if traces_f is not None else None
-                policy_out, values = ac(obs_f[mb], prev_a_mb, traces_mb)
-                logp, entropy, _max_action_prob = evaluate_policy_actions(
-                    policy_out=policy_out,
-                    actions=actions_f[mb],
-                    action_mode=action_mode,
-                    action_low=action_low,
-                    action_high=action_high,
-                )
-
-                log_ratio = logp - logp_old_f[mb]
-                ratio = log_ratio.exp()
-                pg1 = ratio * adv_f[mb]
-                pg2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_f[mb]
-                policy_loss = -torch.min(pg1, pg2).mean()
-                if vf_clip:
-                    value_delta = values - values_old_f[mb]
-                    values_clipped = values_old_f[mb] + torch.clamp(value_delta, -clip_coef, clip_coef)
-                    value_err = (returns_f[mb] - values).pow(2)
-                    value_err_clipped = (returns_f[mb] - values_clipped).pow(2)
-                    value_loss = 0.5 * torch.maximum(value_err, value_err_clipped).mean()
-                else:
-                    value_loss = 0.5 * (returns_f[mb] - values).pow(2).mean()
-
-                pred_loss = torch.tensor(0.0, device=obs.device)
-                if (pred is not None) and (pred_coef > 0.0):
-                    if x_mem_f is None or x_mem_next_f is None:
-                        raise RuntimeError("Predictor loss requires trace memory features (x_mem/x_mem_next).")
-                    x_hat = pred(x_mem_f[mb], actions_f[mb])
-                    pred_loss = (x_mem_next_f[mb] - x_hat).pow(2).mean()
-
-                loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
-
-            opt.zero_grad(set_to_none=True)
-            if grad_scaler is not None and grad_scaler.is_enabled():
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=max_grad_norm)
-                grad_scaler.step(opt)
-                grad_scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(ac.parameters(), max_norm=max_grad_norm)
-                opt.step()
-
-            with torch.no_grad():
-                approx_kl = (logp_old_f[mb] - logp).mean()
-                kl_for_stop = (ratio - 1.0 - log_ratio).mean()
-                clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
-
-            stats["policy_loss"] += policy_loss.detach().item()
-            stats["value_loss"] += value_loss.detach().item()
-            stats["entropy"] += entropy.detach().item()
-            stats["pred_loss"] += pred_loss.detach().item()
-            stats["approx_kl"] += approx_kl.detach().item()
-            stats["clipfrac"] += clipfrac.detach().item()
-            stats["count"] += 1.0
-
-            if kl_early_stop and float(kl_for_stop.detach().item()) > target_kl:
-                stop_due_to_kl = True
-                break
-        if stop_due_to_kl:
-            break
-
-    count = max(stats["count"], 1.0)
-    for k in list(stats.keys()):
-        if k != "count":
-            stats[k] /= count
-    stats.pop("count", None)
-    return stats
 
 
 def ppo_update_recurrent(

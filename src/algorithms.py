@@ -40,6 +40,11 @@ def compute_gae(
     lam: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
+    Reset-aware GAE. ``resets`` marks internal (drift-triggered) trace resets.
+    The one-step bootstrap is preserved at reset boundaries (next value is
+    already computed from post-reset traces). Only the lambda-continuation
+    is blocked so credit assignment does not leak across regime changes.
+
     rewards, dones, resets, values: (T, N)
     last_value: (N,)
     """
@@ -49,21 +54,23 @@ def compute_gae(
     for t in reversed(range(T)):
         next_value = last_value if t == T - 1 else values[t + 1]
         nonterminal = (~dones[t]).float()
-        trunc = (~resets[t]).float()
-        delta = rewards[t] + gamma * nonterminal * trunc * next_value - values[t]
-        last_gae = delta + gamma * lam * nonterminal * trunc * last_gae
+        no_reset = (~resets[t]).float()
+        delta = rewards[t] + gamma * nonterminal * next_value - values[t]
+        last_gae = delta + gamma * lam * nonterminal * no_reset * last_gae
         adv[t] = last_gae
     returns = adv + values
     return adv, returns
 
 
-def _discounted_returns(rewards: torch.Tensor, dones: torch.Tensor, gamma: float) -> torch.Tensor:
+def _discounted_returns(rewards: torch.Tensor, dones: torch.Tensor, gamma: float,
+                        resets: torch.Tensor | None = None) -> torch.Tensor:
     T, N = rewards.shape
     out = torch.zeros_like(rewards)
     ret = torch.zeros(N, device=rewards.device)
     for t in reversed(range(T)):
         nonterminal = (~dones[t]).float()
-        ret = rewards[t] + gamma * nonterminal * ret
+        no_reset = (~resets[t]).float() if resets is not None else 1.0
+        ret = rewards[t] + gamma * nonterminal * no_reset * ret
         out[t] = ret
     return out
 
@@ -115,12 +122,13 @@ def _step_optimizer(
     max_grad_norm: float,
     grad_modules: dict[str, nn.Module] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    all_params = [p for group in opt.param_groups for p in group["params"]]
     module_norms: dict[str, torch.Tensor] = {}
     opt.zero_grad(set_to_none=True)
     if grad_scaler is not None and grad_scaler.is_enabled():
         grad_scaler.scale(loss).backward()
         grad_scaler.unscale_(opt)
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        global_norm = nn.utils.clip_grad_norm_(all_params, max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -132,7 +140,7 @@ def _step_optimizer(
         grad_scaler.update()
     else:
         loss.backward()
-        global_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        global_norm = nn.utils.clip_grad_norm_(all_params, max_norm=max_grad_norm)
         if grad_modules is not None:
             for name, module in grad_modules.items():
                 sq = torch.zeros((), device=global_norm.device)
@@ -506,7 +514,8 @@ def a2c_update(
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
 
-                policy_loss = -(logp * flat["adv_f"][mb].detach()).mean()
+                ratio = (logp - flat["logp_old_f"][mb]).exp()
+                policy_loss = -(ratio * flat["adv_f"][mb].detach()).mean()
                 value_loss = 0.5 * (flat["returns_f"][mb] - values).pow(2).mean()
                 pred_loss = _pred_loss(
                     pred=pred,
@@ -554,7 +563,8 @@ def reinforce_update(
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
 ) -> dict[str, float]:
-    mc_returns = _discounted_returns(batch["rewards"], batch["dones"], gamma=gamma)
+    mc_returns = _discounted_returns(batch["rewards"], batch["dones"], gamma=gamma,
+                                     resets=batch.get("resets", None))
     adv = mc_returns - batch["values_old"]
     flat = _flatten_rollout(batch, adv, mc_returns)
     idx = torch.arange(flat["B"], device=batch["obs"].device)
@@ -578,7 +588,8 @@ def reinforce_update(
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
 
-                policy_loss = -(logp * flat["adv_f"][mb].detach()).mean()
+                ratio = (logp - flat["logp_old_f"][mb]).exp()
+                policy_loss = -(ratio * flat["adv_f"][mb].detach()).mean()
                 value_loss = 0.5 * (flat["returns_f"][mb] - values).pow(2).mean()
                 pred_loss = _pred_loss(
                     pred=pred,

@@ -28,6 +28,7 @@ from src.algorithms import (
     hard_update_,
     linear_schedule,
     normalize_algo_name,
+    ppo_update,
     update_on_policy,
 )
 from src.amt import DriftMonitor, ema_update_, encode_mem, maybe_reset_traces, rollout, rollout_recurrent, trace_update
@@ -40,7 +41,7 @@ from src.envs import (
     PiecewiseDriftWrapper,
 )
 from src.models import ActorCritic, FeatureEncoder, Predictor, RecurrentActorCritic
-from src.ppo import ppo_update, ppo_update_recurrent
+from src.ppo import ppo_update_recurrent
 from src.reporting import start_run_report
 from src.utils import load_env_file, obs_to_tensor, resolve_device, set_seed
 

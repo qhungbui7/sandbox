@@ -9,7 +9,7 @@ Adaptive Memory Traces (AMT) is a compact research playground that tests how wel
 - [`EXAMPLE_USE_ALL_UTILITIES.md`](EXAMPLE_USE_ALL_UTILITIES.md): one-command end-to-end smoke run using the repo utilities.
 - [`DOCKER.md`](DOCKER.md): containerized setup (CPU/GPU) for reproducible runs.
 - [`BASELINE_QA_GUIDE.md`](BASELINE_QA_GUIDE.md): baseline-only questionnaire workflow (PPO-FF + answer sheet generator).
-- [`PAPER.md`](PAPER.md): paper-style overview and experiment plan.
+- [`paper/main.tex`](paper/main.tex): paper source (NeurIPS 2025 submission template).
 
 ## How the training stack fits together
 
