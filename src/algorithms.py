@@ -38,6 +38,7 @@ def compute_gae(
     last_value: torch.Tensor,
     gamma: float,
     lam: float,
+    ignore_resets: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Reset-aware GAE. ``resets`` marks internal (drift-triggered) trace resets.
@@ -54,7 +55,7 @@ def compute_gae(
     for t in reversed(range(T)):
         next_value = last_value if t == T - 1 else values[t + 1]
         nonterminal = (~dones[t]).float()
-        no_reset = (~resets[t]).float()
+        no_reset = 1.0 if ignore_resets else (~resets[t]).float()
         delta = rewards[t] + gamma * nonterminal * next_value - values[t]
         last_gae = delta + gamma * lam * nonterminal * no_reset * last_gae
         adv[t] = last_gae
@@ -63,13 +64,14 @@ def compute_gae(
 
 
 def _discounted_returns(rewards: torch.Tensor, dones: torch.Tensor, gamma: float,
-                        resets: torch.Tensor | None = None) -> torch.Tensor:
+                        resets: torch.Tensor | None = None,
+                        ignore_resets: bool = False) -> torch.Tensor:
     T, N = rewards.shape
     out = torch.zeros_like(rewards)
     ret = torch.zeros(N, device=rewards.device)
     for t in reversed(range(T)):
         nonterminal = (~dones[t]).float()
-        no_reset = (~resets[t]).float() if resets is not None else 1.0
+        no_reset = 1.0 if (ignore_resets or resets is None) else (~resets[t]).float()
         ret = rewards[t] + gamma * nonterminal * no_reset * ret
         out[t] = ret
     return out
@@ -231,6 +233,7 @@ def ppo_update(
     debug_cfg: dict | None = None,
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     bootstrap_stops = batch["dones"]
@@ -242,6 +245,7 @@ def ppo_update(
         batch["value_T"],
         gamma=gamma,
         lam=lam,
+        ignore_resets=ignore_resets,
     )
     flat = _flatten_rollout(batch, adv, returns)
     idx = torch.arange(flat["B"], device=batch["obs"].device)
@@ -481,6 +485,7 @@ def a2c_update(
     use_amp: bool,
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
@@ -491,6 +496,7 @@ def a2c_update(
         batch["value_T"],
         gamma=gamma,
         lam=lam,
+        ignore_resets=ignore_resets,
     )
     flat = _flatten_rollout(batch, adv, returns)
     idx = torch.arange(flat["B"], device=batch["obs"].device)
@@ -562,9 +568,11 @@ def reinforce_update(
     use_amp: bool,
     amp_dtype: torch.dtype,
     grad_scaler: torch.amp.GradScaler | None,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     mc_returns = _discounted_returns(batch["rewards"], batch["dones"], gamma=gamma,
-                                     resets=batch.get("resets", None))
+                                     resets=batch.get("resets", None),
+                                     ignore_resets=ignore_resets)
     adv = mc_returns - batch["values_old"]
     flat = _flatten_rollout(batch, adv, mc_returns)
     idx = torch.arange(flat["B"], device=batch["obs"].device)
@@ -650,6 +658,7 @@ def trpo_update(
     backtrack_coef: float,
     backtrack_iters: int,
     value_epochs: int,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
@@ -660,6 +669,7 @@ def trpo_update(
         batch["value_T"],
         gamma=gamma,
         lam=lam,
+        ignore_resets=ignore_resets,
     )
     flat = _flatten_rollout(batch, adv, returns)
     params = tuple(ac.parameters())
@@ -793,6 +803,7 @@ def vtrace_update(
     grad_scaler: torch.amp.GradScaler | None,
     rho_clip: float,
     c_clip: float,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     T, N = batch["rewards"].shape
     b = T * N
@@ -893,6 +904,7 @@ def vmpo_update(
     eta: float,
     kl_coef: float,
     kl_target: float,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     bootstrap_stops = batch["dones"]
     adv, returns = compute_gae(
@@ -903,6 +915,7 @@ def vmpo_update(
         batch["value_T"],
         gamma=gamma,
         lam=lam,
+        ignore_resets=ignore_resets,
     )
     flat = _flatten_rollout(batch, adv, returns)
     idx = torch.arange(flat["B"], device=batch["obs"].device)
@@ -1003,6 +1016,7 @@ def update_on_policy(
     debug_cfg: dict | None = None,
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     algo_name = normalize_algo_name(algo)
     if algo_name == "ppo":
@@ -1030,6 +1044,7 @@ def update_on_policy(
             debug_cfg=debug_cfg,
             action_low=action_low,
             action_high=action_high,
+            ignore_resets=ignore_resets,
         )
     if algo_name == "a2c":
         return a2c_update(
@@ -1050,6 +1065,7 @@ def update_on_policy(
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             grad_scaler=grad_scaler,
+            ignore_resets=ignore_resets,
         )
     if algo_name == "reinforce":
         return reinforce_update(
@@ -1069,6 +1085,7 @@ def update_on_policy(
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             grad_scaler=grad_scaler,
+            ignore_resets=ignore_resets,
         )
     if algo_name == "trpo":
         return trpo_update(
@@ -1090,6 +1107,7 @@ def update_on_policy(
             backtrack_coef=trpo_backtrack_coef,
             backtrack_iters=trpo_backtrack_iters,
             value_epochs=trpo_value_epochs,
+            ignore_resets=ignore_resets,
         )
     if algo_name == "v-trace":
         return vtrace_update(
@@ -1109,6 +1127,7 @@ def update_on_policy(
             grad_scaler=grad_scaler,
             rho_clip=vtrace_rho_clip,
             c_clip=vtrace_c_clip,
+            ignore_resets=ignore_resets,
         )
     if algo_name == "v-mpo":
         return vmpo_update(
@@ -1133,6 +1152,7 @@ def update_on_policy(
             eta=vmpo_eta,
             kl_coef=vmpo_kl_coef,
             kl_target=vmpo_kl_target,
+            ignore_resets=ignore_resets,
         )
     raise ValueError(f"Unsupported on-policy algorithm: {algo}")
 
@@ -1267,6 +1287,7 @@ def dqn_collect_rollout(
     horizon: int,
     gamma: float,
     lambda_pred: float,
+    drift_signal: str,
     obs_normalization: str,
     alpha_base: torch.Tensor,
     alpha_max: torch.Tensor,
@@ -1330,7 +1351,12 @@ def dqn_collect_rollout(
             if predictor is not None and lambda_pred > 0.0:
                 x_hat = predictor(x_mem_t, action)
                 pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
-            e = delta_prov.abs() + lambda_pred * pred_err
+            if drift_signal == "prediction_only":
+                e = pred_err
+            elif drift_signal == "td_only":
+                e = delta_prov.abs()
+            else:
+                e = delta_prov.abs() + lambda_pred * pred_err
 
             gate, reset_event = drift.update(e)
             reset_event = reset_event & (~done)

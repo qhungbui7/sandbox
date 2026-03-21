@@ -99,6 +99,7 @@ def ppo_update_recurrent(
     debug_cfg: dict | None = None,
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
+    ignore_resets: bool = False,
 ) -> dict[str, float]:
     action_mode = str(getattr(getattr(ac, "f_pol", None), "action_type", "discrete"))
     obs = batch["obs"]
@@ -113,7 +114,7 @@ def ppo_update_recurrent(
     value_T = batch["value_T"]
 
     resets = torch.zeros_like(dones)
-    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam)
+    adv, returns = compute_gae(rewards, dones, resets, values_old, value_T, gamma=gamma, lam=lam, ignore_resets=ignore_resets)
     T, N = rewards.shape
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
     envs_per_minibatch = int(N)

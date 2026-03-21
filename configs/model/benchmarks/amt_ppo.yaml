@@ -8,6 +8,7 @@ model:
   alpha_max: [1.0, 0.5, 0.2]
   lambda_pred: 0.01
   pred_coef: 0.5
+  drift_signal: combined
   reset_strategy: partial
   reset_long_fraction: 0.5
   rho_s: 0.1

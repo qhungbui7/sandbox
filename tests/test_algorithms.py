@@ -131,6 +131,7 @@ def test_on_policy_algorithm_updates_cpu():
         horizon=8,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -224,6 +225,7 @@ def test_ppo_update_supports_plain_mode_without_prev_action_or_traces():
         horizon=8,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -314,6 +316,7 @@ def test_dqn_collect_and_update_cpu():
         horizon=12,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -410,6 +413,7 @@ def test_dqn_collect_rollout_resets_next_prev_action_on_done():
         horizon=4,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_base.clone(),
@@ -467,6 +471,7 @@ def test_on_policy_gae_uses_dones_not_terminated(monkeypatch):
         horizon=6,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -482,7 +487,7 @@ def test_on_policy_gae_uses_dones_not_terminated(monkeypatch):
 
     calls = {"count": 0}
 
-    def _fake_gae(rewards, dones, resets, values, last_value, gamma, lam):
+    def _fake_gae(rewards, dones, resets, values, last_value, gamma, lam, ignore_resets=False):
         calls["count"] += 1
         assert torch.equal(dones, batch["dones"])
         return torch.zeros_like(rewards), torch.zeros_like(values)
@@ -597,6 +602,7 @@ def test_ppo_update_supports_continuous_actions_cpu():
         horizon=8,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -647,3 +653,29 @@ def test_ppo_update_supports_continuous_actions_cpu():
     for key in ["policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]:
         assert key in stats
         assert torch.isfinite(torch.tensor(stats[key]))
+
+
+def test_compute_gae_ignore_resets():
+    set_seed(42)
+    T, N = 8, 2
+    rewards = torch.randn(T, N)
+    dones = torch.zeros(T, N, dtype=torch.bool)
+    resets = torch.zeros(T, N, dtype=torch.bool)
+    resets[3, 0] = True
+    resets[5, 1] = True
+    values = torch.randn(T, N)
+    last_value = torch.randn(N)
+    gamma, lam = 0.99, 0.95
+
+    adv_normal, ret_normal = algorithms_module.compute_gae(
+        rewards, dones, resets, values, last_value, gamma, lam, ignore_resets=False,
+    )
+    adv_ignored, ret_ignored = algorithms_module.compute_gae(
+        rewards, dones, resets, values, last_value, gamma, lam, ignore_resets=True,
+    )
+    adv_no_resets, ret_no_resets = algorithms_module.compute_gae(
+        rewards, dones, torch.zeros_like(resets), values, last_value, gamma, lam, ignore_resets=False,
+    )
+    assert torch.allclose(adv_ignored, adv_no_resets, atol=1e-6)
+    assert torch.allclose(ret_ignored, ret_no_resets, atol=1e-6)
+    assert not torch.allclose(adv_normal, adv_ignored, atol=1e-6)

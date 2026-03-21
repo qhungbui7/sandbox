@@ -248,6 +248,8 @@ def _strict_args_template(**overrides):
         reset_long_fraction=0.5,
         lambda_pred=0.0,
         pred_coef=0.0,
+        drift_signal="combined",
+        gae_ignore_resets=False,
     )
     base.update(overrides)
     return Namespace(**base)
@@ -479,6 +481,7 @@ def test_amt_rollout_and_update_cpu():
         horizon=8,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -787,6 +790,7 @@ def test_ppo_updates_bootstrap_with_dones_not_terminated(monkeypatch):
         horizon=6,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_max,
@@ -802,7 +806,7 @@ def test_ppo_updates_bootstrap_with_dones_not_terminated(monkeypatch):
 
     import src.ppo as ppo_module
 
-    def _fake_gae_ff(rewards, dones, resets, values, last_value, gamma, lam):
+    def _fake_gae_ff(rewards, dones, resets, values, last_value, gamma, lam, ignore_resets=False):
         assert torch.equal(dones, batch_ff["dones"])
         return torch.zeros_like(rewards), torch.zeros_like(values)
 
@@ -853,7 +857,7 @@ def test_ppo_updates_bootstrap_with_dones_not_terminated(monkeypatch):
     batch_rec["dones"][0, 0] = True
     assert torch.any(batch_rec["dones"] != batch_rec["terminated"])
 
-    def _fake_gae_rec(rewards, dones, resets, values, last_value, gamma, lam):
+    def _fake_gae_rec(rewards, dones, resets, values, last_value, gamma, lam, ignore_resets=False):
         assert torch.equal(dones, batch_rec["dones"])
         return torch.zeros_like(rewards), torch.zeros_like(values)
 
@@ -1137,6 +1141,7 @@ def test_rollout_resets_prev_action_and_next_mem_on_done():
         horizon=4,
         gamma=0.99,
         lambda_pred=0.0,
+        drift_signal="combined",
         obs_normalization="none",
         alpha_base=alpha_base,
         alpha_max=alpha_base.clone(),

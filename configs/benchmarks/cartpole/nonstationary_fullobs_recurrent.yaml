@@ -1,0 +1,27 @@
+config_paths:
+  env: ../../env/benchmarks/cartpole/nonstationary_fullobs.yaml
+  model: ../../model/benchmarks/recurrent_ppo.yaml
+  training: ../../training/benchmarks/cartpole_200704.yaml
+  other: ../../other/benchmark_reporting.yaml
+overrides:
+  env:
+    env_id: CartPole-v1
+    mask_indices: []
+    phase_len: 1500
+    obs_shift_scale: 0.1
+    reward_scale_low: 0.8
+    reward_scale_high: 1.2
+  model:
+    algo: ppo
+    policy: recurrent
+  training:
+    num_envs: 8
+    horizon: 128
+    total_steps: 200704
+  other:
+    device: cuda
+    seed: 0
+    wandb: false
+    report: true
+    report_dir: reports/benchmarks
+    report_run_name: cartpole_nonstationary_fullobs_recurrent

@@ -231,6 +231,8 @@ AMT_ONLY_KEYS = {
     "K",
     "cooldown_steps",
     "warmup_steps",
+    "drift_signal",
+    "gae_ignore_resets",
 }
 CARRACING_ONLY_KEYS = {"carracing_downsample", "carracing_grayscale"}
 DRIFT_ONLY_KEYS = {"rho_s", "rho_l", "beta", "tau_soft", "kappa", "tau_on", "tau_off", "K", "cooldown_steps", "warmup_steps"}
@@ -318,12 +320,19 @@ def validate_no_strange_params(args, *, resolved_cfg: dict, cli_dests: set[str])
                 )
         skip_drift = (reset_strategy == "none") and _fixed_alpha_config(args.alpha_base, args.alpha_max)
         if skip_drift:
-            bad_drift_keys = sorted(explicit_keys & (DRIFT_ONLY_KEYS | {"lambda_pred", "pred_coef"}))
+            bad_drift_keys = sorted(explicit_keys & (DRIFT_ONLY_KEYS | {"lambda_pred", "pred_coef", "drift_signal"}))
             if bad_drift_keys:
                 raise ValueError(
                     "Drift/prediction parameters are not used when alpha is fixed and reset strategy is `none`: "
                     + ", ".join(bad_drift_keys)
                 )
+
+    drift_signal_val = str(getattr(args, "drift_signal", "combined")).strip().lower()
+    if drift_signal_val == "prediction_only":
+        lp = float(getattr(args, "lambda_pred", 0.0))
+        pc = float(getattr(args, "pred_coef", 0.0))
+        if lp <= 0.0 or pc <= 0.0:
+            raise ValueError("drift_signal=prediction_only requires lambda_pred > 0 and pred_coef > 0.")
 
     # Algorithm-specific strictness for explicit CLI args only.
     algo_only = {
@@ -1673,6 +1682,7 @@ def train_recurrent(
                 debug_cfg=ppo_debug_cfg,
                 action_low=action_low,
                 action_high=action_high,
+                ignore_resets=args.gae_ignore_resets,
             )
 
             metrics = {
@@ -1927,9 +1937,12 @@ def main():
 
     p.add_argument("--lambda-pred", type=float, default=0.0)
     p.add_argument("--pred-coef", type=float, default=0.0)
+    p.add_argument("--drift-signal", type=str, default="combined",
+                   choices=["combined", "prediction_only", "td_only"])
 
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lam", type=float, default=0.95)
+    p.add_argument("--gae-ignore-resets", action=argparse.BooleanOptionalAction, default=False)
 
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument(
@@ -2731,6 +2744,7 @@ def main():
                     horizon=args.horizon,
                     gamma=args.gamma,
                     lambda_pred=args.lambda_pred,
+                    drift_signal=args.drift_signal,
                     obs_normalization=args.obs_normalization,
                     alpha_base=alpha_base,
                     alpha_max=alpha_max,
@@ -2790,6 +2804,7 @@ def main():
                     debug_cfg=ppo_debug_cfg,
                     action_low=action_low,
                     action_high=action_high,
+                    ignore_resets=args.gae_ignore_resets,
                 )
                 if f_mem is not None:
                     ema_update_(f_mem, ac.f_pol, tau=args.ema_tau)
@@ -2800,6 +2815,8 @@ def main():
                     "diagnostics/gate_mean": (float(drift.state.gate.mean().item()) if drift is not None else 0.0),
                     "optim/lr": float(opt.param_groups[0]["lr"]),
                 }
+                if drift is not None and batch.get("resets") is not None:
+                    metrics["drift/reset_rate"] = batch["resets"].float().mean().item()
                 for key, value in algo_stats.items():
                     if str(key).startswith("debug/"):
                         metrics[key] = value
@@ -2901,6 +2918,7 @@ def main():
                     horizon=args.horizon,
                     gamma=args.gamma,
                     lambda_pred=args.lambda_pred,
+                    drift_signal=args.drift_signal,
                     obs_normalization=args.obs_normalization,
                     alpha_base=alpha_base,
                     alpha_max=alpha_max,

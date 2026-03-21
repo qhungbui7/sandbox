@@ -182,6 +182,7 @@ def rollout(
     horizon: int,
     gamma: float,
     lambda_pred: float,
+    drift_signal: str,
     obs_normalization: str,
     alpha_base: torch.Tensor,
     alpha_max: torch.Tensor,
@@ -348,7 +349,12 @@ def rollout(
                     x_hat = predictor(x_mem_t, action)
                     pred_err = (x_mem_next - x_hat).pow(2).mean(dim=-1)
 
-                e = delta_prov.abs() + lambda_pred * pred_err
+                if drift_signal == "prediction_only":
+                    e = pred_err
+                elif drift_signal == "td_only":
+                    e = delta_prov.abs()
+                else:
+                    e = delta_prov.abs() + lambda_pred * pred_err
 
                 gate, reset_event = drift.update(e)
                 reset_event = reset_event & (~done)

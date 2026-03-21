@@ -2,7 +2,7 @@ import numpy as np
 import gymnasium as gym
 import pytest
 
-from src.envs import CarRacingPreprocessWrapper, DiscreteCarRacingWrapper, FrameStackLastAxisWrapper
+from src.envs import CarRacingPreprocessWrapper, DiscreteCarRacingWrapper, FrameStackLastAxisWrapper, PiecewiseDriftWrapper
 
 
 class DummyCarEnv(gym.Env):
@@ -142,3 +142,48 @@ def test_carracing_preprocess_wrapper_downsample_and_grayscale():
     obs1, _, _, _, _ = wrapped.step(0)
     assert obs1.shape == (4, 4, 1)
     assert obs1.dtype == np.uint8
+
+
+def test_piecewise_drift_wrapper_carry_phase():
+    base = gym.make("CartPole-v1")
+    wrapper = PiecewiseDriftWrapper(
+        base, seed=42, phase_len=5, obs_shift_scale=0.1,
+        reward_scale_low=0.8, reward_scale_high=1.2, carry_phase=True,
+    )
+    obs, info = wrapper.reset(seed=42)
+    assert "phase" in info
+    assert info["phase"] == 0
+
+    for _ in range(6):
+        obs, r, term, trunc, info = wrapper.step(wrapper.action_space.sample())
+        assert "phase" in info
+        if term or trunc:
+            obs, info = wrapper.reset()
+            break
+
+    assert wrapper.t > 0 or wrapper.phase > 0
+    obs, info = wrapper.reset()
+    assert wrapper.t > 0 or wrapper.phase > 0
+    wrapper.close()
+
+
+def test_piecewise_drift_wrapper_default_resets_phase():
+    base = gym.make("CartPole-v1")
+    wrapper = PiecewiseDriftWrapper(
+        base, seed=42, phase_len=5, obs_shift_scale=0.1,
+        reward_scale_low=0.8, reward_scale_high=1.2,
+    )
+    obs, info = wrapper.reset(seed=42)
+    assert "phase" in info
+    assert info["phase"] == 0
+
+    for _ in range(6):
+        obs, r, term, trunc, info = wrapper.step(wrapper.action_space.sample())
+        if term or trunc:
+            break
+
+    obs, info = wrapper.reset()
+    assert wrapper.t == 0
+    assert wrapper.phase == 0
+    assert info["phase"] == 0
+    wrapper.close()

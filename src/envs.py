@@ -33,6 +33,7 @@ class PiecewiseDriftWrapper(gym.Wrapper):
         obs_shift_scale: float,
         reward_scale_low: float,
         reward_scale_high: float,
+        carry_phase: bool = False,
     ):
         super().__init__(env)
         assert isinstance(env.observation_space, gym.spaces.Box)
@@ -41,6 +42,7 @@ class PiecewiseDriftWrapper(gym.Wrapper):
         self.obs_shift_scale = float(obs_shift_scale)
         self.reward_scale_low = float(reward_scale_low)
         self.reward_scale_high = float(reward_scale_high)
+        self.carry_phase = carry_phase
 
         self.t = 0
         self.phase = 0
@@ -49,10 +51,12 @@ class PiecewiseDriftWrapper(gym.Wrapper):
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
-        self.t = 0
-        self.phase = 0
+        if not self.carry_phase:
+            self.t = 0
+            self.phase = 0
         self.shift = self.rng.randn(*obs.shape).astype(np.float32) * self.obs_shift_scale
         self.r_scale = self.rng.uniform(self.reward_scale_low, self.reward_scale_high)
+        info["phase"] = self.phase
         return (obs + self.shift), info
 
     def step(self, action):
@@ -62,6 +66,7 @@ class PiecewiseDriftWrapper(gym.Wrapper):
             self.phase += 1
             self.shift = self.rng.randn(*obs.shape).astype(np.float32) * self.obs_shift_scale
             self.r_scale = self.rng.uniform(self.reward_scale_low, self.reward_scale_high)
+        info["phase"] = self.phase
         return (obs + self.shift), (reward * self.r_scale), terminated, truncated, info
 
 

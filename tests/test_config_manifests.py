@@ -63,6 +63,7 @@ def test_section_configs_define_required_keys():
             "dqn_eps_start",
             "dqn_eps_end",
             "dqn_eps_decay_steps",
+            "gae_ignore_resets",
         },
         "other": {"device", "seed", "wandb", "report", "report_dir"},
     }
@@ -84,7 +85,7 @@ def test_section_configs_define_required_keys():
                 if reset_strategy != "none":
                     amt_required.add("reset_long_fraction")
                 if not (fixed_alpha and reset_strategy == "none"):
-                    amt_required.update({"lambda_pred", "pred_coef"})
+                    amt_required.update({"lambda_pred", "pred_coef", "drift_signal"})
                     amt_required.update(
                         {
                             "rho_s",
