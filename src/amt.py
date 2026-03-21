@@ -509,7 +509,7 @@ def rollout_recurrent(
 
         next_prev_action = action.clone() if use_prev_action else None
         if done.any():
-            done_idx = torch.as_tensor(done, device=device)
+            done_idx = torch.as_tensor(np.where(done)[0], device=device, dtype=torch.long)
             h[:, done_idx] = 0.0
             c[:, done_idx] = 0.0
             if use_prev_action:

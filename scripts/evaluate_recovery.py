@@ -229,7 +229,7 @@ def evaluate_recovery_feedforward(
     step_resets = []
 
     obs_np, info = env.reset(seed=seed)
-    prev_action = init_prev_action(1, action_mode, act_dim, device) if use_prev_action else None
+    prev_action = init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device) if use_prev_action else None
     traces = None
     if use_traces:
         traces = torch.zeros((1, M, feat_dim), device=device)
@@ -241,11 +241,14 @@ def evaluate_recovery_feedforward(
         obs_t = obs_to_tensor(obs_np, device=device, obs_normalization=obs_norm).unsqueeze(0)
         traces_flat = traces.reshape(1, -1) if traces is not None else None
         policy_out, value = ac(obs_t, prev_action, traces_flat)
-        action, logp, entropy, latent = sample_policy_actions(
-            policy_out, action_mode, deterministic=True,
-            action_shape=action_shape, action_low=action_low, action_high=action_high,
+        action, _, _, _ = sample_policy_actions(
+            policy_out=policy_out, action_mode=action_mode, deterministic=True,
+            action_low=action_low, action_high=action_high,
         )
-        action_np = actions_to_env_numpy(action, action_mode, action_shape=action_shape)
+        action_np = actions_to_env_numpy(
+            actions=action, action_mode=action_mode, action_shape=action_shape,
+            action_low=action_low, action_high=action_high,
+        )
         if action_np.ndim > 1:
             action_np = action_np[0]
 
@@ -267,7 +270,8 @@ def evaluate_recovery_feedforward(
                     next_obs_t, next_pa,
                     trace_update(traces, x_mem_next, alpha_base.expand(1, -1)).reshape(1, -1),
                 )
-                delta_prov = reward + gamma * (not (terminated or truncated)) * v_prov.squeeze() - value.squeeze()
+                nonterminal = 0.0 if (terminated or truncated) else 1.0
+                delta_prov = reward + gamma * nonterminal * v_prov.squeeze() - value.squeeze()
                 pred_err = torch.zeros(1, device=device)
                 if predictor is not None and lambda_pred > 0.0:
                     x_hat = predictor(x_mem_t, action)
@@ -293,7 +297,7 @@ def evaluate_recovery_feedforward(
         if terminated or truncated:
             obs_np, info = env.reset()
             if use_prev_action:
-                prev_action = init_prev_action(1, action_mode, act_dim, device)
+                prev_action = init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device)
             if use_traces:
                 traces = torch.zeros((1, M, feat_dim), device=device)
                 obs_t_new = obs_to_tensor(obs_np, device=device, obs_normalization=obs_norm).unsqueeze(0)
@@ -387,19 +391,20 @@ def evaluate_recovery_recurrent(
     step_phases = []
 
     obs_np, info = env.reset(seed=seed)
-    prev_action = init_prev_action(1, action_mode, act_dim, device) if use_prev_action else None
-    h = torch.zeros(1, 1, feat_dim, device=device)
-    c = torch.zeros(1, 1, feat_dim, device=device)
+    prev_action = init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device) if use_prev_action else None
+    h, c = ac.init_hidden(batch_size=1, device=device)
 
     for step_idx in range(eval_steps):
         obs_t = obs_to_tensor(obs_np, device=device, obs_normalization=obs_norm).unsqueeze(0)
-        policy_out, value, (h, c) = ac(obs_t.unsqueeze(0), prev_action.unsqueeze(0) if prev_action is not None else None, (h, c))
-        policy_out = policy_out.squeeze(0)
-        action, logp, entropy, latent = sample_policy_actions(
-            policy_out, action_mode, deterministic=True,
-            action_shape=action_shape, action_low=action_low, action_high=action_high,
+        policy_out, value, (h, c) = ac(obs_t, prev_action, (h, c))
+        action, _, _, _ = sample_policy_actions(
+            policy_out=policy_out, action_mode=action_mode, deterministic=True,
+            action_low=action_low, action_high=action_high,
         )
-        action_np = actions_to_env_numpy(action, action_mode, action_shape=action_shape)
+        action_np = actions_to_env_numpy(
+            actions=action, action_mode=action_mode, action_shape=action_shape,
+            action_low=action_low, action_high=action_high,
+        )
         if action_np.ndim > 1:
             action_np = action_np[0]
 
@@ -413,9 +418,8 @@ def evaluate_recovery_recurrent(
         if terminated or truncated:
             obs_np, info = env.reset()
             if use_prev_action:
-                prev_action = init_prev_action(1, action_mode, act_dim, device)
-            h = torch.zeros(1, 1, feat_dim, device=device)
-            c = torch.zeros(1, 1, feat_dim, device=device)
+                prev_action = init_prev_action(num_envs=1, action_mode=action_mode, act_dim=act_dim, device=device)
+            h, c = ac.init_hidden(batch_size=1, device=device)
         else:
             obs_np = next_obs_np
 
@@ -456,6 +460,8 @@ def evaluate_recovery_recurrent(
         "recovery_times": recovery_times,
         "mean_recovery_time": float(np.mean(valid_times)) if valid_times else -1.0,
         "median_recovery_time": float(np.median(valid_times)) if valid_times else -1.0,
+        "total_resets": 0,
+        "reset_rate": 0.0,
     }
 
 

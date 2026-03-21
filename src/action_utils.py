@@ -34,6 +34,7 @@ def policy_dist(policy_out: torch.Tensor, *, action_mode: str):
 
 
 def _continuous_params(policy_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    policy_out = policy_out.float()
     if policy_out.shape[-1] % 2 != 0:
         raise ValueError(f"Continuous policy output must have even last dimension, got {tuple(policy_out.shape)}")
     mean, log_std = torch.chunk(policy_out, 2, dim=-1)

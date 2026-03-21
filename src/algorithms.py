@@ -515,7 +515,9 @@ def a2c_update(
         for start in range(0, flat["B"], minibatch_size):
             mb = perm[start : start + minibatch_size]
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
+                prev_a_mb = flat["prev_a_f"][mb] if flat["prev_a_f"] is not None else None
+                traces_mb = flat["traces_f"][mb] if flat["traces_f"] is not None else None
+                logits, values = ac(flat["obs_f"][mb], prev_a_mb, traces_mb)
                 dist = Categorical(logits=logits)
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
@@ -526,9 +528,9 @@ def a2c_update(
                 pred_loss = _pred_loss(
                     pred=pred,
                     pred_coef=pred_coef,
-                    x_mem=flat["x_mem_f"][mb],
+                    x_mem=(flat["x_mem_f"][mb] if flat["x_mem_f"] is not None else None),
                     actions=flat["actions_f"][mb],
-                    x_mem_next=flat["x_mem_next_f"][mb],
+                    x_mem_next=(flat["x_mem_next_f"][mb] if flat["x_mem_next_f"] is not None else None),
                 )
                 loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
@@ -591,7 +593,9 @@ def reinforce_update(
         for start in range(0, flat["B"], minibatch_size):
             mb = perm[start : start + minibatch_size]
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
+                prev_a_mb = flat["prev_a_f"][mb] if flat["prev_a_f"] is not None else None
+                traces_mb = flat["traces_f"][mb] if flat["traces_f"] is not None else None
+                logits, values = ac(flat["obs_f"][mb], prev_a_mb, traces_mb)
                 dist = Categorical(logits=logits)
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
@@ -602,9 +606,9 @@ def reinforce_update(
                 pred_loss = _pred_loss(
                     pred=pred,
                     pred_coef=pred_coef,
-                    x_mem=flat["x_mem_f"][mb],
+                    x_mem=(flat["x_mem_f"][mb] if flat["x_mem_f"] is not None else None),
                     actions=flat["actions_f"][mb],
-                    x_mem_next=flat["x_mem_next_f"][mb],
+                    x_mem_next=(flat["x_mem_next_f"][mb] if flat["x_mem_next_f"] is not None else None),
                 )
                 loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + pred_coef * pred_loss
 
@@ -805,15 +809,18 @@ def vtrace_update(
     c_clip: float,
     ignore_resets: bool = False,
 ) -> dict[str, float]:
+    # NOTE: ignore_resets accepted for interface uniformity with other updates but is
+    # a no-op here. V-trace uses importance-weighted returns (_vtrace_targets), not GAE,
+    # so there is no lambda-continuation to block at drift-reset boundaries.
     T, N = batch["rewards"].shape
     b = T * N
 
     obs_f = batch["obs"].reshape(b, -1)
-    prev_a_f = batch["prev_action"].reshape(b)
-    traces_f = batch["traces"].reshape(b, -1)
+    prev_a_f = batch["prev_action"].reshape(b) if batch.get("prev_action") is not None else None
+    traces_f = batch["traces"].reshape(b, -1) if batch.get("traces") is not None else None
     actions_f = batch["actions"].reshape(b)
-    x_mem_f = batch["x_mem"].reshape(b, -1)
-    x_mem_next_f = batch["x_mem_next"].reshape(b, -1)
+    x_mem_f = batch["x_mem"].reshape(b, -1) if batch.get("x_mem") is not None else None
+    x_mem_next_f = batch["x_mem_next"].reshape(b, -1) if batch.get("x_mem_next") is not None else None
 
     logp_old = batch["logp_old"]
     rewards = batch["rewards"]
@@ -936,7 +943,9 @@ def vmpo_update(
         for start in range(0, flat["B"], minibatch_size):
             mb = perm[start : start + minibatch_size]
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-                logits, values = ac(flat["obs_f"][mb], flat["prev_a_f"][mb], flat["traces_f"][mb])
+                prev_a_mb = flat["prev_a_f"][mb] if flat["prev_a_f"] is not None else None
+                traces_mb = flat["traces_f"][mb] if flat["traces_f"] is not None else None
+                logits, values = ac(flat["obs_f"][mb], prev_a_mb, traces_mb)
                 dist = Categorical(logits=logits)
                 logp = dist.log_prob(flat["actions_f"][mb])
                 entropy = dist.entropy().mean()
@@ -950,9 +959,9 @@ def vmpo_update(
                 pred_loss = _pred_loss(
                     pred=pred,
                     pred_coef=pred_coef,
-                    x_mem=flat["x_mem_f"][mb],
+                    x_mem=(flat["x_mem_f"][mb] if flat["x_mem_f"] is not None else None),
                     actions=flat["actions_f"][mb],
-                    x_mem_next=flat["x_mem_next_f"][mb],
+                    x_mem_next=(flat["x_mem_next_f"][mb] if flat["x_mem_next_f"] is not None else None),
                 )
                 approx_kl = (flat["logp_old_f"][mb] - logp).mean()
                 kl_penalty = F.relu(approx_kl - kl_target)
